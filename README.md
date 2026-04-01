@@ -43,6 +43,10 @@
 - [`jiuzhou-multi-account-status.user.js`](./jiuzhou-multi-account-status.user.js)：Tampermonkey 脚本版
 - [`index.html`](./index.html)：独立 HTML 版
 
+## Releases
+
+- [GitHub Releases](https://github.com/yuai404/jiuzhou-multi-account-status/releases)
+
 ## 快速开始
 
 ### Tampermonkey（推荐）

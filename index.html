@@ -33,20 +33,22 @@
 </head>
 <body>
   <div class="page-note">
-    这是独立 HTML 版 <strong>v0.7.0</strong>。默认 API Base 为 <code>https://jz.faith.wang/api</code>，页面会以全屏横向布局打开管理面板，左边账号列表、右边账号详情。<br>
-    已兼容本地图片验证码和腾讯点击验证码；如果你的浏览器或服务端策略阻止本地 HTML 跨域请求，或拦截腾讯验证码 SDK，请改用同目录的 Tampermonkey 版：
+    这是独立 HTML 版 <strong>v0.8.4</strong>。默认 API Base 为
+    <code>https://jz.faith.wang/api</code>，页面会以全屏横向布局打开管理面板，左侧账号列表，右侧账号详情。<br>
+    已兼容本地图片验证码和腾讯点击验证码；如果你的浏览器或服务端策略阻止本地 HTML 跨域请求，
+    或拦截腾讯验证码 SDK，请改用同目录的 Tampermonkey 版：
     <code>./jiuzhou-multi-account-status.user.js</code>
   </div>
 
   <script>
     window.__JZ_MULTI_ACCOUNT_TOOL_CONFIG__ = {
-      version: '0.7.0',
+      version: '0.8.4',
       defaultApiBase: 'https://jz.faith.wang/api',
       open: true,
       layout: 'page',
       panelWidth: 1360,
     };
   </script>
-  <script src="./jiuzhou-multi-account-status.user.js"></script>
+  <script src="./jiuzhou-multi-account-status.user.js?v=0.8.4"></script>
 </body>
 </html>

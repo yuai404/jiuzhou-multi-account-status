@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         九州多账号状态管理
 // @namespace    https://jz.faith.wang/
-// @version      0.7.0
+// @version      0.8.4
 // @description  Multi-account dashboard with stamina countdown, idle, auto-idle, auto-dungeon, currency, rare items, technique and recruit cooldowns.
 // @author       OpenAI Codex
 // @match        https://jz.faith.wang/*
@@ -18,7 +18,7 @@
   const IS_PAGE = LAYOUT_MODE === 'page';
   const PANEL_SIDE = !IS_PAGE && BOOT.side === 'left' ? 'left' : 'right';
   const PANEL_WIDTH = Math.max(420, Math.min(1600, Number(BOOT.panelWidth) || (IS_PAGE ? 1360 : 460)));
-  const SCRIPT_VERSION = str(BOOT.version) || '0.7.0';
+  const SCRIPT_VERSION = str(BOOT.version) || '0.8.4';
   const KEY = 'jzMultiAccountTool:v3';
   const DEFAULT_MONTH_CARD_ID = 'monthcard-001';
   const JOB = {
@@ -54,6 +54,9 @@
   const SECT_FRAGMENT_DONATION_SPIRIT_STONES = 2500;
   const SECT_FRAGMENT_ITEM_DEF_ID = 'mat-gongfa-canye';
   const SECT_FRAGMENT_SHOP_ITEM_ID = 'sect-shop-005';
+  const WANDER_OPTION_COUNT = 3;
+  const WANDER_PENDING_JOB_POLL_INTERVAL_MS = 2000;
+  const WANDER_PENDING_JOB_MAX_POLLS = 45;
   const DUNGEON_TYPE_LABELS = { material: '材料', equipment: '装备', trial: '试炼', challenge: '挑战', event: '活动' };
   const RARE_ITEMS = [
     { key: 'monthCard', label: '修行月卡', itemDefId: 'cons-monthcard-001' },
@@ -84,8 +87,13 @@
     signInAllBusy: false,
     monthCardClaimAllBusy: false,
     sectExchangeAllBusy: false,
+    wanderAllBusy: false,
     noticeMessage: '',
     noticeError: '',
+    wanderOpenById: Object.create(null),
+    wanderChoiceDraftById: Object.create(null),
+    scrollPositions: Object.create(null),
+    lastScrollAt: 0,
   };
   const C = { loaded: false, loading: true, provider: 'local', tencentAppId: 0, error: '', sdkLoading: false };
   const D = { loaded: false, loading: false, error: '', list: [], fetchedAt: 0 };
@@ -120,6 +128,9 @@
           signInError: str(a.signInError),
           monthCard: normalizeMonthCardState(a.monthCard),
           monthCardError: str(a.monthCardError),
+          wanderOverview: normalizeWanderOverview(a.wanderOverview),
+          wanderError: str(a.wanderError),
+          wanderOptionIndex: normalizeWanderOptionIndex(a.wanderOptionIndex),
           dungeonId: str(a.dungeonId),
           dungeonRank: Math.max(1, Math.floor(Number(a.dungeonRank) || 1)),
           dungeonLastStopReason: str(a.dungeonLastStopReason),
@@ -153,7 +164,7 @@
     return {
       id: uid(), order, alias: '', username: '', token: '', user: null, hasCharacter: null,
       character: null, idle: null, idleError: '', idleConfig: null, idleAutoEnabled: true, idleAutoArmed: true,
-      technique: null, partner: null, signIn: null, signInError: '', monthCard: null, monthCardError: '', dungeonId: '', dungeonRank: 1, dungeonLastStopReason: '', rareItems: emptyRareItems(), inventoryError: '',
+          technique: null, partner: null, signIn: null, signInError: '', monthCard: null, monthCardError: '', wanderOverview: null, wanderError: '', wanderOptionIndex: 0, dungeonId: '', dungeonRank: 1, dungeonLastStopReason: '', rareItems: emptyRareItems(), inventoryError: '',
       techniqueNoticeKey: '', partnerNoticeKey: '',
       lastLoginAt: '', lastRefreshAt: '', lastError: '', lastMessage: '',
     };
@@ -170,6 +181,8 @@
     a.signInError = '';
     a.monthCard = null;
     a.monthCardError = '';
+    a.wanderOverview = null;
+    a.wanderError = '';
     a.dungeonLastStopReason = '';
     a.rareItems = emptyRareItems();
     a.inventoryError = '';
@@ -245,7 +258,12 @@
     if (active && active !== document.body && active !== UI.host && isInteractiveElement(active)) return active;
     return null;
   }
-  function shouldPauseLiveUiUpdates() { return !!activeInteractiveElement(); }
+  function isUserScrollingRecently() {
+    return Date.now() - Math.max(0, Number(UI.lastScrollAt) || 0) < 300;
+  }
+  function shouldPauseLiveUiUpdates() {
+    return !!activeInteractiveElement();
+  }
   function setGlobalNotice(message = '', error = '') {
     UI.noticeMessage = str(message);
     UI.noticeError = str(error);
@@ -258,6 +276,23 @@
     UI.pendingRender = false;
     render();
     return true;
+  }
+  function rememberScrollPositions() {
+    if (!UI.shadow) return;
+    UI.shadow.querySelectorAll('[data-scroll-key]').forEach((el) => {
+      const key = str(el.getAttribute('data-scroll-key'));
+      if (!key) return;
+      UI.scrollPositions[key] = Math.max(0, Math.floor(Number(el.scrollTop) || 0));
+    });
+  }
+  function restoreScrollPositions() {
+    if (!UI.shadow) return;
+    UI.shadow.querySelectorAll('[data-scroll-key]').forEach((el) => {
+      const key = str(el.getAttribute('data-scroll-key'));
+      if (!key) return;
+      const top = Math.max(0, Math.floor(Number(UI.scrollPositions[key]) || 0));
+      if (top > 0) el.scrollTop = top;
+    });
   }
   function sectFragmentTotalContributionCost(qty = SECT_FRAGMENT_BATCH_QTY, unitCost = SECT_FRAGMENT_UNIT_COST) {
     return Math.max(1, Math.floor(Number(qty) || 0)) * Math.max(1, Math.floor(Number(unitCost) || 0));
@@ -387,6 +422,110 @@
       fetchedAtMs: Math.max(0, Math.floor(Number(v.fetchedAtMs) || 0)),
     };
   }
+  function normalizeWanderOptionIndex(v) {
+    return Math.max(0, Math.min(WANDER_OPTION_COUNT - 1, Math.floor(Number(v) || 0)));
+  }
+  function normalizeWanderJob(v) {
+    if (!v || typeof v !== 'object') return null;
+    return {
+      generationId: str(v.generationId),
+      status: str(v.status),
+      startedAt: str(v.startedAt),
+      finishedAt: str(v.finishedAt) || null,
+      errorMessage: str(v.errorMessage) || null,
+    };
+  }
+  function normalizeWanderEpisodeOption(v) {
+    if (!v || typeof v !== 'object') return null;
+    return {
+      index: Math.max(0, Math.floor(Number(v.index) || 0)),
+      text: str(v.text),
+    };
+  }
+  function normalizeWanderEpisode(v) {
+    if (!v || typeof v !== 'object') return null;
+    const rawChosenOptionIndex = v.chosenOptionIndex;
+    return {
+      id: str(v.id),
+      dayKey: str(v.dayKey),
+      dayIndex: Math.max(0, Math.floor(Number(v.dayIndex) || 0)),
+      title: str(v.title),
+      opening: str(v.opening),
+      options: (Array.isArray(v.options) ? v.options : []).map((option, index) => normalizeWanderEpisodeOption({
+        ...(option && typeof option === 'object' ? option : {}),
+        index: Number.isFinite(Number(option?.index)) ? Number(option.index) : index,
+      })).filter(Boolean),
+      chosenOptionIndex: rawChosenOptionIndex === null || rawChosenOptionIndex === '' || typeof rawChosenOptionIndex === 'undefined'
+        ? null
+        : (Number.isFinite(Number(rawChosenOptionIndex)) ? Math.max(0, Math.floor(Number(rawChosenOptionIndex))) : null),
+      chosenOptionText: str(v.chosenOptionText) || null,
+      summary: str(v.summary),
+      isEnding: v.isEnding === true,
+      endingType: str(v.endingType),
+      rewardTitleName: str(v.rewardTitleName) || null,
+      rewardTitleDesc: str(v.rewardTitleDesc) || null,
+      createdAt: str(v.createdAt),
+      chosenAt: str(v.chosenAt) || null,
+    };
+  }
+  function normalizeWanderStory(v) {
+    if (!v || typeof v !== 'object') return null;
+    const episodes = (Array.isArray(v.episodes) ? v.episodes : [])
+      .map(normalizeWanderEpisode)
+      .filter(Boolean)
+      .sort((a, b) => a.dayIndex - b.dayIndex || a.createdAt.localeCompare(b.createdAt));
+    return {
+      id: str(v.id),
+      status: str(v.status),
+      theme: str(v.theme),
+      premise: str(v.premise),
+      summary: str(v.summary),
+      episodeCount: Math.max(0, Math.floor(Number(v.episodeCount) || episodes.length)),
+      rewardTitleId: str(v.rewardTitleId) || null,
+      finishedAt: str(v.finishedAt) || null,
+      createdAt: str(v.createdAt),
+      updatedAt: str(v.updatedAt),
+      episodes,
+    };
+  }
+  function normalizeWanderGeneratedTitle(v) {
+    if (!v || typeof v !== 'object') return null;
+    return {
+      id: str(v.id),
+      name: str(v.name),
+      description: str(v.description),
+      color: str(v.color) || null,
+      effects: v.effects && typeof v.effects === 'object' ? v.effects : {},
+      isEquipped: v.isEquipped === true,
+      obtainedAt: str(v.obtainedAt),
+    };
+  }
+  function normalizeWanderOverview(v) {
+    if (!v || typeof v !== 'object') return null;
+    const hasPendingEpisode = v.hasPendingEpisode === true;
+    const currentEpisode = normalizeWanderEpisode(v.currentEpisode);
+    if (hasPendingEpisode && currentEpisode) {
+      currentEpisode.pendingChoice = true;
+      currentEpisode.chosenOptionIndex = null;
+      currentEpisode.chosenOptionText = null;
+      currentEpisode.chosenAt = null;
+    }
+    return {
+      today: str(v.today),
+      aiAvailable: v.aiAvailable === true,
+      hasPendingEpisode,
+      canGenerate: v.canGenerate === true,
+      isCoolingDown: v.isCoolingDown === true,
+      cooldownUntil: str(v.cooldownUntil) || null,
+      cooldownRemainingSeconds: Math.max(0, Math.floor(Number(v.cooldownRemainingSeconds) || 0)),
+      currentGenerationJob: normalizeWanderJob(v.currentGenerationJob),
+      activeStory: normalizeWanderStory(v.activeStory),
+      currentEpisode,
+      latestFinishedStory: normalizeWanderStory(v.latestFinishedStory),
+      generatedTitles: (Array.isArray(v.generatedTitles) ? v.generatedTitles : []).map(normalizeWanderGeneratedTitle).filter(Boolean),
+      fetchedAtMs: Math.max(0, Math.floor(Number(v.fetchedAtMs) || 0)) || Date.now(),
+    };
+  }
   function normalizeAutoSkillPolicy(v) {
     const slots = Array.isArray(v?.slots) ? v.slots : [];
     return { slots: slots.map((slot) => ({ skillId: str(slot?.skillId ?? slot?.skill_id), priority: Math.max(0, Math.floor(Number(slot?.priority) || 0)) })).filter((slot) => slot.skillId) };
@@ -430,11 +569,54 @@
     const autoRefreshText = S.autoRefreshMinutes > 0 ? `每 ${S.autoRefreshMinutes} 分钟` : '已关闭';
     return `版本 v${SCRIPT_VERSION} · 自动刷新 ${autoRefreshText} · 验证码 ${providerName()} · API ${S.apiBase}`;
   }
+  function summarizeWanderAccounts() {
+    const summary = { ready: 0, pending: 0, generating: 0, cooling: 0, failed: 0, unavailable: 0 };
+    for (const a of S.accounts) {
+      if (!a?.token || !a?.character) continue;
+      if (a.wanderError) {
+        summary.failed += 1;
+        continue;
+      }
+      const overview = normalizeWanderOverview(a.wanderOverview);
+      if (!overview) continue;
+      if (!overview.aiAvailable) {
+        summary.unavailable += 1;
+        continue;
+      }
+      if (overview.currentGenerationJob?.status === 'pending') {
+        summary.generating += 1;
+        continue;
+      }
+      if (overview.currentGenerationJob?.status === 'failed') {
+        summary.failed += 1;
+        continue;
+      }
+      if (overview.hasPendingEpisode) {
+        summary.pending += 1;
+        continue;
+      }
+      if (overview.isCoolingDown) {
+        summary.cooling += 1;
+        continue;
+      }
+      if (overview.canGenerate) summary.ready += 1;
+    }
+    return summary;
+  }
+  function globalWanderSummaryText() {
+    const s = summarizeWanderAccounts();
+    return `可开始 ${s.ready} · 待选择 ${s.pending} · 生成中 ${s.generating}`;
+  }
+  function globalWanderSummaryExtra() {
+    const s = summarizeWanderAccounts();
+    return `冷却中 ${s.cooling}<br>失败/读取异常 ${s.failed}<br>AI 未配置 ${s.unavailable}`;
+  }
   function globalSummaryCards() {
     return `
       <div class="summary-grid">
         ${summaryCard('全局灵石 / 银两', `灵石 ${esc(num(totalSpiritStones()))} · 银两 ${esc(num(totalSilver()))}`, '')}
         ${summaryCard('全局稀有物品', esc(totalRareItemsText()), totalRareItemsExtra())}
+        ${summaryCard('全局云游', esc(globalWanderSummaryText()), globalWanderSummaryExtra())}
         ${summaryCard('上次自动刷新', esc(lastAutoRefreshText()), S.autoRefreshMinutes > 0 ? `当前频率：每 ${esc(S.autoRefreshMinutes)} 分钟` : '自动刷新已关闭')}
       </div>`;
   }
@@ -495,6 +677,261 @@
     lines.push(`到期：${esc(fmtTime(st.expireAt))}`);
     lines.push(st.canClaim ? '今日奖励：可领取' : `今日奖励：${st.today && st.lastClaimDate === st.today ? '已领取' : '暂不可领'}`);
     return lines.join('<br>');
+  }
+  function getWanderDraft(id, episodeId = '') {
+    const row = UI.wanderChoiceDraftById[id];
+    if (!row || typeof row !== 'object') return null;
+    if (episodeId && str(row.episodeId) !== str(episodeId)) return null;
+    const optionIndex = Number.isFinite(Number(row.optionIndex)) ? Math.max(0, Math.floor(Number(row.optionIndex))) : null;
+    return optionIndex === null ? null : { episodeId: str(row.episodeId), optionIndex };
+  }
+  function setWanderDraft(id, episodeId, optionIndex) {
+    UI.wanderChoiceDraftById[id] = {
+      episodeId: str(episodeId),
+      optionIndex: Math.max(0, Math.floor(Number(optionIndex) || 0)),
+    };
+  }
+  function clearWanderDraft(id, episodeId = '') {
+    if (!episodeId) {
+      delete UI.wanderChoiceDraftById[id];
+      return;
+    }
+    const row = getWanderDraft(id, episodeId);
+    if (row) delete UI.wanderChoiceDraftById[id];
+  }
+  function wanderDraftIndex(id, episode) {
+    const options = Array.isArray(episode?.options) ? episode.options : [];
+    const draft = getWanderDraft(id, episode?.id);
+    if (draft && options.some((option) => option.index === draft.optionIndex)) return draft.optionIndex;
+    if (episode?.pendingChoice === true) return null;
+    if (Number.isFinite(Number(episode?.chosenOptionIndex))) return Math.max(0, Math.floor(Number(episode.chosenOptionIndex)));
+    return null;
+  }
+  function wanderDraftLabel(id, episode) {
+    const idx = wanderDraftIndex(id, episode);
+    return idx === null ? '未选择' : `抉择 ${idx + 1}`;
+  }
+  function syncWanderChoiceUi(id, episodeId) {
+    const root = UI.shadow;
+    if (!root) return;
+    const draft = getWanderDraft(id, episodeId);
+    const draftIndex = draft ? draft.optionIndex : null;
+    root.querySelectorAll('[data-action="wanderPick"]').forEach((el) => {
+      if (str(el.getAttribute('data-id')) !== str(id) || str(el.getAttribute('data-episode-id')) !== str(episodeId)) return;
+      const optionIndex = Math.max(0, Math.floor(Number(el.getAttribute('data-option-index')) || 0));
+      const picked = draftIndex !== null && optionIndex === draftIndex;
+      el.classList.toggle('is-preferred', picked);
+      el.setAttribute('aria-pressed', picked ? 'true' : 'false');
+    });
+    root.querySelectorAll('[data-wander-confirm-text]').forEach((el) => {
+      if (str(el.getAttribute('data-id')) !== str(id) || str(el.getAttribute('data-episode-id')) !== str(episodeId)) return;
+      el.textContent = `当前待确认：${draftIndex === null ? '未选择' : `抉择 ${draftIndex + 1}`}`;
+    });
+    root.querySelectorAll('[data-action="wanderConfirm"]').forEach((el) => {
+      if (str(el.getAttribute('data-id')) !== str(id) || str(el.getAttribute('data-episode-id')) !== str(episodeId)) return;
+      if (!loadState(id).wanderAction) el.disabled = draftIndex === null;
+    });
+  }
+  function readCheckedWanderOptionFromDom(id, episodeId) {
+    const root = UI.shadow;
+    if (!root) return null;
+    const name = `wander-choice-${id}-${episodeId}`;
+    const checked = root.querySelector(`input[name="${name}"]:checked`);
+    if (!checked) return null;
+    const value = checked.getAttribute('value');
+    return Number.isFinite(Number(value)) ? Math.max(0, Math.floor(Number(value))) : null;
+  }
+  function wanderRemain(overview) {
+    if (!overview) return 0;
+    const untilMs = overview.cooldownUntil ? new Date(overview.cooldownUntil).getTime() : NaN;
+    if (Number.isFinite(untilMs)) return Math.max(0, Math.ceil((untilMs - Date.now()) / 1000));
+    const fetched = Math.max(0, Math.floor(Number(overview.fetchedAtMs) || 0)) || Date.now();
+    return Math.max(0, Math.floor(Number(overview.cooldownRemainingSeconds) || 0) - Math.floor((Date.now() - fetched) / 1000));
+  }
+  function wanderHistoryStory(overview) {
+    if (!overview) return null;
+    return overview.activeStory || overview.latestFinishedStory || null;
+  }
+  function wanderCurrentEpisode(overview) {
+    return overview?.currentEpisode || null;
+  }
+  function wanderText(a) {
+    if (!a?.character) return a?.hasCharacter === false ? '未创建角色' : '未读取';
+    if (a.wanderError) return a.wanderError === '接口未部署' ? '暂不可用' : '读取失败';
+    const overview = normalizeWanderOverview(a.wanderOverview);
+    if (!overview) return '未读取';
+    if (!overview.aiAvailable) return 'AI 未配置';
+    if (overview.currentGenerationJob?.status === 'pending') return '生成中';
+    if (overview.currentGenerationJob?.status === 'failed') return '生成失败';
+    const currentEpisode = wanderCurrentEpisode(overview);
+    if (overview.hasPendingEpisode && currentEpisode) return `第 ${Math.max(1, currentEpisode.dayIndex || 1)} 幕待选择`;
+    if (overview.isCoolingDown) return `冷却 ${dur(wanderRemain(overview))}`;
+    if (overview.canGenerate) return '可开始';
+    if (currentEpisode?.rewardTitleName) return `已结幕 · ${currentEpisode.rewardTitleName}`;
+    if (wanderHistoryStory(overview)?.theme) return `进行中 · ${wanderHistoryStory(overview).theme}`;
+    return '待刷新';
+  }
+  function wanderExtra(a) {
+    if (!a?.character) return a?.hasCharacter === false ? '账号已登录，但尚未创建角色' : '未读取';
+    if (a.wanderError) return `云游状态读取失败：${esc(a.wanderError)}`;
+    const overview = normalizeWanderOverview(a.wanderOverview);
+    if (!overview) return '未读取';
+    const currentEpisode = wanderCurrentEpisode(overview);
+    const lines = [
+      `今日日期：${esc(overview.today || '未返回')}`,
+      `AI：${esc(overview.aiAvailable ? '可用' : '未配置')}`,
+    ];
+    if (overview.currentGenerationJob?.status) lines.push(`生成任务：${esc(overview.currentGenerationJob.status)}`);
+    if (overview.currentGenerationJob?.status === 'failed' && overview.currentGenerationJob.errorMessage) {
+      lines.push(`失败原因：${esc(overview.currentGenerationJob.errorMessage)}`);
+    }
+    if (currentEpisode) {
+      lines.push(`当前幕：第 ${esc(Math.max(1, currentEpisode.dayIndex || 1))} 幕 · ${esc(currentEpisode.title || '未命名')}`);
+      if (overview.hasPendingEpisode === true) lines.push(`待确认：${esc(wanderDraftLabel(a.id, currentEpisode))}`);
+      if (currentEpisode.chosenOptionText) lines.push(`已选：${esc(currentEpisode.chosenOptionText)}`);
+    }
+    if (overview.isCoolingDown) lines.push(`冷却剩余：${esc(dur(wanderRemain(overview)))}`);
+    const story = wanderHistoryStory(overview);
+    if (story?.theme) lines.push(`故事：${esc(story.theme)}`);
+    return lines.join('<br>');
+  }
+  function wanderActionLabel(a) {
+    const overview = normalizeWanderOverview(a?.wanderOverview);
+    if (!a?.token) return '一键云游';
+    if (loadState(a.id).wanderAction) return '云游中...';
+    if (!overview) return '一键云游';
+    if (overview.currentGenerationJob?.status === 'pending') return '生成中...';
+    if (overview.currentGenerationJob?.status === 'failed') return '重新云游';
+    const currentEpisode = wanderCurrentEpisode(overview);
+    if (overview.hasPendingEpisode && currentEpisode) return '前往确认';
+    if (overview.canGenerate && !overview.isCoolingDown) return '开始云游';
+    if (overview.isCoolingDown) return `冷却 ${dur(wanderRemain(overview))}`;
+    return '一键云游';
+  }
+  function wanderTagHtml(text, tone = '') {
+    return `<span class="wander-tag${tone ? ` ${tone}` : ''}">${esc(text)}</span>`;
+  }
+  function wanderTagsHtml(overview) {
+    if (!overview) return '';
+    const tags = [];
+    if (!overview.aiAvailable) tags.push(wanderTagHtml('AI 未配置', 'is-error'));
+    if (overview.hasPendingEpisode) tags.push(wanderTagHtml('待选择', 'is-warn'));
+    if (overview.isCoolingDown) tags.push(wanderTagHtml('冷却中', 'is-ok'));
+    if (overview.currentGenerationJob?.status === 'pending') tags.push(wanderTagHtml('生成中', 'is-info'));
+    if (overview.currentGenerationJob?.status === 'failed') tags.push(wanderTagHtml('生成失败', 'is-error'));
+    if (overview.canGenerate && !overview.isCoolingDown && overview.currentGenerationJob === null) tags.push(wanderTagHtml('可开始', 'is-ready'));
+    return tags.join('');
+  }
+  function wanderCurrentEpisodeActionsHtml(a, overview) {
+    const episode = wanderCurrentEpisode(overview);
+    if (!episode) return '';
+    const needsChoice = overview?.hasPendingEpisode === true;
+    if (needsChoice) episode.pendingChoice = true;
+    const draftIndex = needsChoice
+      ? (() => {
+        const draft = getWanderDraft(a.id, episode.id);
+        if (draft) return draft.optionIndex;
+        return null;
+      })()
+      : (Number.isFinite(Number(episode.chosenOptionIndex)) ? Math.max(0, Math.floor(Number(episode.chosenOptionIndex))) : null);
+    const options = (Array.isArray(episode.options) ? episode.options : []).map((option, listIndex) => {
+      const optionIndex = Number.isFinite(Number(option?.index)) ? Math.max(0, Math.floor(Number(option.index))) : listIndex;
+      const classes = ['wander-option-line'];
+      if (draftIndex !== null && optionIndex === draftIndex) classes.push('is-preferred');
+      if (!needsChoice && episode.chosenOptionIndex === optionIndex) classes.push('is-chosen');
+      return needsChoice
+        ? `<button class="${classes.join(' ')}" type="button" data-action="wanderPick" data-id="${esc(a.id)}" data-episode-id="${esc(episode.id)}" data-option-index="${esc(optionIndex)}" aria-pressed="${draftIndex !== null && optionIndex === draftIndex ? 'true' : 'false'}"><span>抉择 ${esc(optionIndex + 1)}</span><span>${esc(option?.text || '未返回')}</span></button>`
+        : `<div class="${classes.join(' ')}"><span>抉择 ${esc(optionIndex + 1)}</span><span>${esc(option?.text || '未返回')}</span></div>`;
+    }).join('');
+    const confirmBar = needsChoice
+      ? `<div class="wander-confirm-bar"><div class="wander-confirm-text" data-wander-confirm-text data-id="${esc(a.id)}" data-episode-id="${esc(episode.id)}">当前待确认：${esc(wanderDraftLabel(a.id, episode))}</div><button class="btn" data-action="wanderConfirm" data-id="${esc(a.id)}" data-episode-id="${esc(episode.id)}" ${draftIndex === null || loadState(a.id).wanderAction ? 'disabled' : ''}>${loadState(a.id).wanderAction ? '确认中...' : '确认选择'}</button></div>`
+      : `<div class="wander-confirm-bar"><div class="wander-confirm-text">已选：${esc(episode.chosenOptionText || `抉择 ${episode.chosenOptionIndex + 1}`)}</div>${overview.isCoolingDown ? `<div class="wander-confirm-hint">冷却剩余：${esc(dur(wanderRemain(overview)))}</div>` : ''}</div>`;
+    const rewardLine = episode.rewardTitleName
+      ? `<div class="wander-episode-reward">结幕称号：${esc(episode.rewardTitleName)}${episode.rewardTitleDesc ? ` · ${esc(episode.rewardTitleDesc)}` : ''}</div>`
+      : '';
+    return `
+      <div class="wander-current-box">
+        <div class="wander-current-head">
+          <div class="wander-current-title">当前幕：第 ${esc(Math.max(1, episode.dayIndex || 1))} 幕 · ${esc(episode.title || '未命名')}</div>
+          ${episode.isEnding ? wanderTagHtml('终幕', 'is-warn') : ''}
+        </div>
+        ${episode.opening ? `<div class="wander-episode-opening">${esc(episode.opening)}</div>` : ''}
+        ${options ? `<div class="wander-option-list">${options}</div>` : ''}
+        ${confirmBar}
+        ${episode.summary ? `<div class="wander-episode-summary">${esc(episode.summary)}</div>` : ''}
+        ${rewardLine}
+      </div>`;
+  }
+  function wanderStoryEntriesHtml(a, overview) {
+    const story = wanderHistoryStory(overview);
+    if (!story) return '<div class="wander-empty">尚未开启任何云游故事。</div>';
+    const currentEpisodeId = str(wanderCurrentEpisode(overview)?.id);
+    const entries = (Array.isArray(story.episodes) ? story.episodes : []).filter((episode) => str(episode?.id) !== currentEpisodeId).map((episode) => {
+      const options = (Array.isArray(episode.options) ? episode.options : []).map((option, listIndex) => {
+        const optionIndex = Number.isFinite(Number(option?.index)) ? Math.max(0, Math.floor(Number(option.index))) : listIndex;
+        const classes = ['wander-option-line'];
+        if (episode.chosenOptionIndex === optionIndex) classes.push('is-chosen');
+        return `<div class="${classes.join(' ')}"><span>抉择 ${esc(optionIndex + 1)}</span><span>${esc(option?.text || '未返回')}</span></div>`;
+      }).join('');
+      const resultLine = episode.chosenOptionText
+        ? `<div class="wander-episode-result">已选：${esc(episode.chosenOptionText)}</div>`
+        : '<div class="wander-episode-result is-pending">尚未选择。</div>';
+      const rewardLine = episode.rewardTitleName
+        ? `<div class="wander-episode-reward">结幕称号：${esc(episode.rewardTitleName)}${episode.rewardTitleDesc ? ` · ${esc(episode.rewardTitleDesc)}` : ''}</div>`
+        : '';
+      return `
+        <article class="wander-entry">
+          <div class="wander-entry-head">
+            <div class="wander-entry-title">第 ${esc(Math.max(1, episode.dayIndex || 1))} 幕 · ${esc(episode.title || '未命名')}</div>
+            ${episode.isEnding ? wanderTagHtml('终幕', 'is-warn') : ''}
+          </div>
+          ${episode.opening ? `<div class="wander-episode-opening">${esc(episode.opening)}</div>` : ''}
+          ${options ? `<div class="wander-option-list">${options}</div>` : ''}
+          ${resultLine}
+          ${episode.summary ? `<div class="wander-episode-summary">${esc(episode.summary)}</div>` : ''}
+          ${rewardLine}
+        </article>`;
+    }).join('');
+    return `
+      <div class="wander-story-head">
+        <div class="wander-story-theme">${esc(story.theme || '云游故事')}</div>
+        <div class="wander-story-meta">共 ${esc(story.episodeCount || story.episodes.length)} 幕 · 状态 ${esc(story.status || '未知')}</div>
+      </div>
+      ${story.premise ? `<div class="wander-story-premise">${esc(story.premise)}</div>` : ''}
+      <div class="wander-story-list" data-scroll-key="wander-story-${esc(a.id)}">${entries || '<div class="wander-empty">暂无幕次内容。</div>'}</div>`;
+  }
+  function wanderPanelHtml(a) {
+    const open = UI.wanderOpenById[a.id] === true;
+    const overview = normalizeWanderOverview(a.wanderOverview);
+    const currentEpisode = wanderCurrentEpisode(overview);
+    if (overview?.hasPendingEpisode !== true && currentEpisode?.chosenOptionIndex !== null) clearWanderDraft(a.id, currentEpisode?.id);
+    const currentSummary = overview
+      ? (currentEpisode
+        ? `当前第 ${Math.max(1, currentEpisode.dayIndex || 1)} 幕 · ${currentEpisode.title || '未命名'}`
+        : (overview.currentGenerationJob?.status === 'pending'
+          ? '云游生成中，完成后会自动出现在这里'
+          : (overview.isCoolingDown ? `冷却剩余 ${dur(wanderRemain(overview))}` : '当前暂无可展示的幕次')))
+      : (a.wanderError ? `读取失败：${a.wanderError}` : '请先刷新状态');
+    return `
+      <div class="wander-panel-box">
+        <button type="button" class="wander-fold" data-toggle-wander="${esc(a.id)}" aria-expanded="${open ? 'true' : 'false'}">
+          <div class="wander-fold-main">
+            <div class="wander-fold-title">云游详情</div>
+            <div class="wander-fold-sub">${esc(currentSummary)}</div>
+          </div>
+          <div class="wander-fold-side">${open ? '收起' : '展开'}</div>
+        </button>
+        <div class="wander-fold-body ${open ? 'show' : ''}">
+          ${overview ? `
+            <div class="wander-overview-top">
+              <div class="wander-tag-row">${wanderTagsHtml(overview)}</div>
+              <div class="wander-overview-note">今日日期：${esc(overview.today || '未返回')}</div>
+            </div>
+            ${wanderCurrentEpisodeActionsHtml(a, overview)}
+            ${wanderStoryEntriesHtml(a, overview)}
+          ` : `<div class="wander-empty">${esc(a.wanderError ? `云游状态读取失败：${a.wanderError}` : '当前暂无云游内容，请先刷新或执行一键云游。')}</div>`}
+        </div>
+      </div>`;
   }
   function idleConfigReady(cfg) { return !!(cfg && cfg.mapId && cfg.roomId && cfg.targetMonsterDefId && cfg.maxDurationMs > 0); }
   function idleConfigSummary(cfg) { return cfg ? `${cfg.mapId || '?'} / ${cfg.roomId || '?'} / ${cfg.targetMonsterDefId || '?'} / ${dur(Math.floor(cfg.maxDurationMs / 1000), '0秒')}` : '未读取'; }
@@ -725,7 +1162,7 @@
   function loadState(id) {
     if (!L.has(id)) L.set(id, {});
     const state = L.get(id);
-    ['captcha', 'login', 'refresh', 'idleStart', 'idleStop', 'dungeonStart', 'sectExchange', 'signIn', 'monthCardClaim'].forEach((key) => {
+    ['captcha', 'login', 'refresh', 'idleStart', 'idleStop', 'dungeonStart', 'sectExchange', 'signIn', 'monthCardClaim', 'wanderAction'].forEach((key) => {
       if (typeof state[key] !== 'boolean') state[key] = false;
     });
     return state;
@@ -1655,6 +2092,19 @@
     const q = new URLSearchParams({ monthCardId: str(monthCardId) || DEFAULT_MONTH_CARD_ID });
     return (await api(`/monthcard/status?${q.toString()}`, { token }))?.data || null;
   }
+  async function readWanderOverview(token) {
+    return (await api('/wander/overview', { token }))?.data || null;
+  }
+  async function generateWander(token) {
+    return (await api('/wander/generate', { method: 'POST', token }))?.data || null;
+  }
+  async function chooseWanderOption(token, episodeId, optionIndex) {
+    return (await api('/wander/choose', {
+      method: 'POST',
+      token,
+      body: { episodeId: str(episodeId), optionIndex: Math.max(0, Math.floor(Number(optionIndex) || 0)) },
+    }))?.data || null;
+  }
   async function readIdleConfig(token) {
     return normalizeIdleConfig((await api('/idle/config', { token }))?.data?.config);
   }
@@ -2002,6 +2452,254 @@
       setGlobalNotice('', `全局月卡领取失败：${e.message || e}`);
     } finally {
       UI.monthCardClaimAllBusy = false;
+      render();
+    }
+  }
+  async function refreshWanderState(id, { silent = false } = {}) {
+    const a = acct(id);
+    if (!a?.token) throw new Error('请先登录账号');
+    const overview = normalizeWanderOverview({ ...(await readWanderOverview(a.token) || {}), fetchedAtMs: Date.now() });
+    a.wanderOverview = overview;
+    a.wanderError = '';
+    if (!silent) {
+      save();
+      renderWhenSafe();
+    }
+    return overview;
+  }
+  async function pollWanderUntilSettled(id, { fromGlobal = false } = {}) {
+    const a = acct(id);
+    if (!a?.token) throw new Error('请先登录账号');
+    let latest = null;
+    for (let i = 0; i < WANDER_PENDING_JOB_MAX_POLLS; i += 1) {
+      latest = await refreshWanderState(id, { silent: true });
+      if (latest?.currentGenerationJob?.status !== 'pending') return latest;
+      setMsg(a, `${fromGlobal ? '全局云游' : '云游'}生成中...（${i + 1}/${WANDER_PENDING_JOB_MAX_POLLS}）`, '');
+      save();
+      renderWhenSafe();
+      await sleep(WANDER_PENDING_JOB_POLL_INTERVAL_MS);
+    }
+    return latest;
+  }
+  async function executeWander(id, { fromGlobal = false } = {}) {
+    const a = acct(id);
+    if (!a) return { success: false, skipped: true, message: '账号不存在' };
+    if (!a.token) {
+      setMsg(a, '', '请先登录账号');
+      render();
+      return { success: false, skipped: true, message: '未登录' };
+    }
+    const state = loadState(id);
+    if (state.wanderAction || state.refresh || state.login) {
+      return { success: false, skipped: true, message: '账号正忙' };
+    }
+    setBusy(id, 'wanderAction', true);
+    setMsg(a, fromGlobal ? '全局云游中...' : '云游执行中...', '');
+    render();
+    try {
+      let overview = a.character ? normalizeWanderOverview(a.wanderOverview) : null;
+      if (!a.character?.id) await refresh(id, true);
+      if (!overview) overview = await refreshWanderState(id, { silent: true });
+      if (!overview?.aiAvailable) {
+        const message = overview ? '当前服务器未配置云游 AI' : '云游状态未读取';
+        setMsg(a, message, '');
+        save();
+        render();
+        return { success: true, skipped: true, unavailable: true, message };
+      }
+      if (overview.currentGenerationJob?.status === 'pending') {
+        overview = await pollWanderUntilSettled(id, { fromGlobal });
+      }
+      if (overview?.currentGenerationJob?.status === 'failed' && !overview.currentEpisode) {
+        setMsg(a, fromGlobal ? '全局云游重新推演中...' : '云游重新推演中...', '');
+        save();
+        renderWhenSafe();
+        await generateWander(a.token);
+        overview = await pollWanderUntilSettled(id, { fromGlobal });
+      } else if (overview?.canGenerate && !overview?.isCoolingDown && !overview?.hasPendingEpisode && !overview?.currentEpisode) {
+        setMsg(a, fromGlobal ? '全局云游开启中...' : '云游开启中...', '');
+        save();
+        renderWhenSafe();
+        await generateWander(a.token);
+        overview = await pollWanderUntilSettled(id, { fromGlobal });
+      }
+      if (!overview) {
+        setMsg(a, '', '云游状态读取失败');
+        save();
+        render();
+        return { success: false, message: '云游状态读取失败' };
+      }
+      if (overview.currentGenerationJob?.status === 'pending') {
+        a.wanderOverview = overview;
+        a.wanderError = '';
+        setMsg(a, '云游仍在生成中，请稍后再试', '');
+        save();
+        render();
+        return { success: true, skipped: true, pending: true, message: '生成中' };
+      }
+      if (overview.currentGenerationJob?.status === 'failed') {
+        const message = overview.currentGenerationJob.errorMessage || '云游生成失败';
+        a.wanderOverview = overview;
+        a.wanderError = '';
+        setMsg(a, '', `云游失败：${message}`);
+        save();
+        render();
+        return { success: false, message };
+      }
+      const currentEpisode = wanderCurrentEpisode(overview);
+      if (overview.hasPendingEpisode && currentEpisode) {
+        UI.wanderOpenById[id] = true;
+        setMsg(a, fromGlobal ? '已生成新云游，请到下方详情里手动选择并确认' : '请到下方云游详情里选择并确认', '');
+        save();
+        render();
+        return { success: true, pendingChoice: true, message: '待手动确认' };
+      }
+      if (overview.isCoolingDown) {
+        setMsg(a, `云游冷却中：${dur(wanderRemain(overview))}`, '');
+        a.wanderOverview = overview;
+        a.wanderError = '';
+        save();
+        render();
+        return { success: true, skipped: true, cooling: true, message: '冷却中' };
+      }
+      if (overview.canGenerate) {
+        setMsg(a, '云游已就绪，可再次执行', '');
+        a.wanderOverview = overview;
+        a.wanderError = '';
+        save();
+        render();
+        return { success: true, skipped: true, ready: true, message: '可开始' };
+      }
+      a.wanderOverview = overview;
+      a.wanderError = '';
+      setMsg(a, '当前无需云游操作', '');
+      save();
+      render();
+      return { success: true, skipped: true, message: '无需操作' };
+    } catch (e) {
+      const message = (typeof e?.message === 'string' ? e.message : String(e || '')).trim() || '未知错误';
+      if (Number(e?.status) === 401) {
+        a.token = '';
+        a.user = null;
+        a.hasCharacter = null;
+        clearCharacterState(a);
+        setMsg(a, '', '登录状态已失效，请重新登录');
+        save();
+        render();
+        return { success: false, message: '登录状态已失效，请重新登录' };
+      }
+      setMsg(a, '', `云游失败：${message}`);
+      save();
+      render();
+      return { success: false, message };
+    } finally {
+      setBusy(id, 'wanderAction', false);
+      save();
+      render();
+    }
+  }
+  async function confirmWanderChoice(id, episodeId) {
+    const a = acct(id);
+    if (!a) return { success: false, message: '账号不存在' };
+    if (!a.token) {
+      setMsg(a, '', '请先登录账号');
+      render();
+      return { success: false, message: '未登录' };
+    }
+    const state = loadState(id);
+    if (state.wanderAction || state.refresh || state.login) return { success: false, skipped: true, message: '账号正忙' };
+    const overview = normalizeWanderOverview(a.wanderOverview);
+    const currentEpisode = wanderCurrentEpisode(overview);
+    const draft = getWanderDraft(id, episodeId);
+    if (!currentEpisode || str(currentEpisode.id) !== str(episodeId) || overview?.hasPendingEpisode !== true) {
+      setMsg(a, '', '\u5f53\u524d\u6ca1\u6709\u5f85\u786e\u8ba4\u7684\u4e91\u6e38\u9009\u9879');
+      render();
+      return { success: false, message: '\u5f53\u524d\u6ca1\u6709\u5f85\u786e\u8ba4\u7684\u4e91\u6e38\u9009\u9879' };
+    }
+    const effectiveDraft = draft || (overview?.hasPendingEpisode === true ? null : (Number.isFinite(Number(currentEpisode.chosenOptionIndex))
+      ? { episodeId: currentEpisode.id, optionIndex: Math.max(0, Math.floor(Number(currentEpisode.chosenOptionIndex))) }
+      : null));
+    if (!effectiveDraft || !Array.isArray(currentEpisode.options) || !currentEpisode.options.some((option, index) => {
+      const optionIndex = Number.isFinite(Number(option?.index)) ? Math.max(0, Math.floor(Number(option.index))) : index;
+      return optionIndex === effectiveDraft.optionIndex;
+    })) {
+      setMsg(a, '', '请先在下方详情里点选一个抉择');
+      render();
+      return { success: false, message: '请先选择抉择' };
+    }
+    setBusy(id, 'wanderAction', true);
+    setMsg(a, `确认云游抉择 ${effectiveDraft.optionIndex + 1} 中...`, '');
+    render();
+    try {
+      const chooseResult = await chooseWanderOption(a.token, currentEpisode.id, effectiveDraft.optionIndex);
+      const latest = await refreshWanderState(id, { silent: true });
+      clearWanderDraft(id, episodeId);
+      const awardedTitle = chooseResult?.awardedTitle?.name || latest?.currentEpisode?.rewardTitleName || '';
+      const baseMessage = `云游已确认抉择 ${effectiveDraft.optionIndex + 1}`;
+      setMsg(a, awardedTitle ? `${baseMessage}，获得称号「${awardedTitle}」` : baseMessage, '');
+      save();
+      render();
+      return { success: true, awardedTitle };
+    } catch (e) {
+      const message = (typeof e?.message === 'string' ? e.message : String(e || '')).trim() || '未知错误';
+      if (Number(e?.status) === 401) {
+        a.token = '';
+        a.user = null;
+        a.hasCharacter = null;
+        clearCharacterState(a);
+        clearWanderDraft(id);
+        setMsg(a, '', '登录状态已失效，请重新登录');
+        save();
+        render();
+        return { success: false, message: '登录状态已失效，请重新登录' };
+      }
+      setMsg(a, '', `确认云游失败：${message}`);
+      save();
+      render();
+      return { success: false, message };
+    } finally {
+      setBusy(id, 'wanderAction', false);
+      save();
+      render();
+    }
+  }
+  async function executeWanderAll() {
+    const ids = S.accounts.filter((a) => a.token).map((a) => a.id);
+    if (!ids.length) {
+      setGlobalNotice('', '没有可执行云游的已登录账号');
+      render();
+      return;
+    }
+    if (UI.wanderAllBusy) return;
+    UI.wanderAllBusy = true;
+    setGlobalNotice(`全局云游中：${ids.length} 个账号`, '');
+    render();
+    let success = 0;
+    let failed = 0;
+    let cooling = 0;
+    let pending = 0;
+    let needConfirm = 0;
+    let skipped = 0;
+    try {
+      for (const id of ids) {
+        const result = await executeWander(id, { fromGlobal: true });
+        if (result?.success) {
+          if (result.pendingChoice) needConfirm += 1;
+          else if (result.ready) success += 1;
+          else if (result.cooling) cooling += 1;
+          else if (result.pending) pending += 1;
+          else skipped += 1;
+        } else if (result?.skipped) {
+          skipped += 1;
+        } else {
+          failed += 1;
+        }
+      }
+      setGlobalNotice(`全局云游完成：已开启/刷新 ${success}，待手动确认 ${needConfirm}，冷却中 ${cooling}，生成中 ${pending}，跳过 ${skipped}，失败 ${failed}`, '');
+    } catch (e) {
+      setGlobalNotice('', `全局云游失败：${e.message || e}`);
+    } finally {
+      UI.wanderAllBusy = false;
       render();
     }
   }
@@ -2497,7 +3195,7 @@
           spiritStones: Math.max(0, Math.floor(Number(c.spirit_stones ?? c.spiritStones) || 0)),
           silver: Math.max(0, Math.floor(Number(c.silver) || 0)),
         };
-        const [tr, pr, ir, icr, rr, sr, mr] = await Promise.allSettled([
+        const [tr, pr, ir, icr, rr, sr, mr, wr] = await Promise.allSettled([
           api(`/character/${cid}/technique/research/status`, { token: a.token }),
           api('/partner/recruit/status', { token: a.token }),
           api('/idle/status', { token: a.token }),
@@ -2505,6 +3203,7 @@
           fetchRareItems(a.token),
           readSignInOverview(a.token),
           readMonthCardStatus(a.token, DEFAULT_MONTH_CARD_ID),
+          readWanderOverview(a.token),
         ]);
         if (tr.status === 'rejected') throw tr.reason;
         if (pr.status === 'rejected') throw pr.reason;
@@ -2562,6 +3261,13 @@
           a.monthCard = null;
           a.monthCardError = Number(mr.reason?.status) === 404 ? '接口未部署' : (str(mr.reason?.message || mr.reason) || '读取失败');
         }
+        if (wr.status === 'fulfilled') {
+          a.wanderOverview = normalizeWanderOverview({ ...(wr.value || {}), fetchedAtMs: Date.now() });
+          a.wanderError = '';
+        } else {
+          a.wanderOverview = null;
+          a.wanderError = Number(wr.reason?.status) === 404 ? '接口未部署' : (str(wr.reason?.message || wr.reason) || '读取失败');
+        }
         a.idleAutoEnabled = true;
         a.idleAutoArmed = true;
         a.lastRefreshAt = now();
@@ -2570,6 +3276,7 @@
         if (a.inventoryError) notes.push(`背包：${a.inventoryError}`);
         if (a.signInError) notes.push(`签到：${a.signInError}`);
         if (a.monthCardError) notes.push(`月卡：${a.monthCardError}`);
+        if (a.wanderError) notes.push(`云游：${a.wanderError}`);
         setMsg(a, notes.length ? `状态刷新成功（${notes.join('；')}）` : '状态刷新成功', '');
       }
     } catch (e) {
@@ -2602,7 +3309,7 @@
     }
   }
   function flushDeferredUiWork() {
-    if (shouldPauseLiveUiUpdates()) return;
+    if (shouldPauseLiveUiUpdates() || isUserScrollingRecently()) return;
     if (UI.pendingAutoRefresh) {
       UI.pendingAutoRefresh = false;
       void refreshAll(true);
@@ -2625,6 +3332,7 @@
     T.delete(id);
     L.delete(id);
     R.delete(id);
+    delete UI.wanderOpenById[id];
     if (UI.selectedId === id) UI.selectedId = S.accounts[0]?.id || '';
     save();
     render();
@@ -2684,6 +3392,9 @@
     } else if (field === 'dungeonRank') {
       a.dungeonRank = Math.max(1, Math.floor(Number(val) || 1));
       save();
+    } else if (field === 'wanderOptionIndex') {
+      a.wanderOptionIndex = normalizeWanderOptionIndex(val);
+      save();
     }
   }
   function styles() {
@@ -2701,7 +3412,7 @@
       .x{display:${IS_PAGE ? 'none' : 'inline-flex'}}
       .settings-box{display:none}
       .settings-box.show{display:block}
-      .cfg,.grid,.stats,.summary-grid{display:grid;gap:10px} .cfg{grid-template-columns:${IS_PAGE ? 'repeat(4,minmax(0,1fr))' : '1fr 1fr'};margin-top:12px} .cfg .wide{grid-column:1 / -1} .grid,.stats{grid-template-columns:1fr 1fr} .summary-grid{grid-template-columns:${IS_PAGE ? 'repeat(3,minmax(0,1fr))' : '1fr'};margin:12px 0 0}
+      .cfg,.grid,.stats,.summary-grid,.feature-grid{display:grid;gap:10px} .cfg{grid-template-columns:${IS_PAGE ? 'repeat(4,minmax(0,1fr))' : '1fr 1fr'};margin-top:12px} .cfg .wide{grid-column:1 / -1} .grid,.stats{grid-template-columns:1fr 1fr} .feature-grid{grid-template-columns:${IS_PAGE ? 'repeat(3,minmax(0,1fr))' : '1fr'};margin-top:12px} .summary-grid{grid-template-columns:${IS_PAGE ? 'repeat(auto-fit,minmax(220px,1fr))' : '1fr'};margin:12px 0 0}
       .body{flex:1;overflow:auto;padding:${IS_PAGE ? '16px' : '12px'};background:rgba(2,6,23,.65)} .list{display:${IS_PAGE ? 'grid' : 'flex'};${IS_PAGE ? 'grid-template-columns:repeat(auto-fit,minmax(420px,1fr));align-items:start;' : 'flex-direction:column;'}gap:${IS_PAGE ? '16px' : '12px'}}
       .page-layout{display:grid;grid-template-columns:minmax(260px,320px) minmax(0,1fr);gap:16px;align-items:start}
       .side{position:sticky;top:0;display:flex;flex-direction:column;gap:12px;padding:12px;border:1px solid rgba(148,163,184,.16);border-radius:14px;background:rgba(15,23,42,.82)}
@@ -2718,7 +3429,7 @@
       .name{margin:0;font-size:16px;font-weight:800} .meta{margin-top:4px;font-size:12px;color:#94a3b8;line-height:1.5}
       .badge{display:inline-flex;align-items:center;justify-content:center;padding:4px 10px;border-radius:999px;font-size:11px;font-weight:800;white-space:nowrap;background:rgba(148,163,184,.18);color:#cbd5e1}
       .badge.on{background:rgba(22,163,74,.18);color:#86efac}
-      label{display:flex;flex-direction:column;gap:6px;font-size:12px;color:#cbd5e1} input,select,textarea{width:100%;border:1px solid rgba(148,163,184,.22);border-radius:10px;background:rgba(15,23,42,.88);color:#f8fafc;padding:10px 12px;outline:none} textarea{min-height:100px;resize:vertical}
+      label{display:flex;flex-direction:column;gap:6px;font-size:12px;color:#cbd5e1} input:not([type="checkbox"]):not([type="radio"]),select,textarea{width:100%;border:1px solid rgba(148,163,184,.22);border-radius:10px;background:rgba(15,23,42,.88);color:#f8fafc;padding:10px 12px;outline:none} textarea{min-height:100px;resize:vertical}
       input[disabled]{opacity:.72;cursor:not-allowed}
       .inline{display:flex;align-items:center;gap:8px;border:1px solid rgba(148,163,184,.22);border-radius:10px;padding:10px 12px;background:rgba(15,23,42,.88)} .inline input{width:auto;margin:0;padding:0} .perm,.import-note{font-size:12px;color:#94a3b8}
       .cap{display:grid;grid-template-columns:120px 1fr;gap:12px;margin-top:12px} .img{height:56px;border-radius:12px;border:1px solid rgba(148,163,184,.18);display:flex;align-items:center;justify-content:center;overflow:hidden;background:rgba(2,6,23,.75)} .img img{width:100%;height:100%;object-fit:contain;background:#fff}
@@ -2726,11 +3437,50 @@
       .msg{margin-top:12px;padding:10px 12px;border-radius:12px;font-size:12px;line-height:1.5;background:rgba(30,64,175,.22);color:#bfdbfe} .msg.err{background:rgba(127,29,29,.26);color:#fecaca}
       .st{border:1px solid rgba(148,163,184,.14);border-radius:12px;padding:10px 12px;background:rgba(2,6,23,.5)} .sl{font-size:11px;color:#94a3b8} .sv{margin-top:6px;font-size:14px;font-weight:800;line-height:1.45} .sx{margin-top:6px;font-size:11px;color:#94a3b8;line-height:1.5}
       .summary-card{border:1px solid rgba(148,163,184,.14);border-radius:12px;padding:10px 12px;background:rgba(2,6,23,.45)} .summary-card .label{font-size:11px;color:#94a3b8} .summary-card .value{margin-top:6px;font-size:14px;font-weight:800;line-height:1.45} .summary-card .extra{margin-top:6px;font-size:11px;color:#94a3b8;line-height:1.5}
-      .toolbar{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px} .empty,.foot{font-size:12px;color:#94a3b8} .empty{padding:26px 18px;text-align:center;border:1px dashed rgba(148,163,184,.25);border-radius:14px} .foot{margin-top:10px;line-height:1.6}
+      .toolbar{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px} .toolbar.daily{margin-top:10px} .empty,.foot{font-size:12px;color:#94a3b8} .empty{padding:26px 18px;text-align:center;border:1px dashed rgba(148,163,184,.25);border-radius:14px} .foot{margin-top:10px;line-height:1.6}
+      .wander-panel-box{margin-top:12px;border:1px solid rgba(148,163,184,.14);border-radius:14px;background:rgba(2,6,23,.42);overflow:hidden}
+      .wander-fold{width:100%;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;border:0;background:transparent;color:#e5edf5;cursor:pointer;text-align:left}
+      .wander-fold:hover{background:rgba(15,23,42,.5)}
+      .wander-fold-main{min-width:0}
+      .wander-fold-title{font-size:13px;font-weight:800}
+      .wander-fold-sub{margin-top:4px;font-size:12px;line-height:1.5;color:#94a3b8}
+      .wander-fold-side{flex:0 0 auto;font-size:12px;font-weight:700;color:#93c5fd}
+      .wander-fold-body{display:none;padding:0 14px 14px}
+      .wander-fold-body.show{display:block}
+      .wander-overview-top{display:flex;flex-direction:column;gap:8px;padding-top:2px}
+      .wander-tag-row{display:flex;flex-wrap:wrap;gap:8px}
+      .wander-tag{display:inline-flex;align-items:center;justify-content:center;padding:3px 8px;border-radius:999px;background:rgba(148,163,184,.14);font-size:11px;font-weight:700;color:#cbd5e1}
+      .wander-tag.is-info{background:rgba(37,99,235,.18);color:#bfdbfe}
+      .wander-tag.is-ok{background:rgba(22,163,74,.18);color:#86efac}
+      .wander-tag.is-warn{background:rgba(217,119,6,.18);color:#fcd34d}
+      .wander-tag.is-error{background:rgba(127,29,29,.28);color:#fecaca}
+      .wander-tag.is-ready{background:rgba(30,64,175,.22);color:#93c5fd}
+      .wander-overview-note,.wander-story-meta{font-size:12px;color:#94a3b8;line-height:1.5}
+      .wander-story-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-top:10px}
+      .wander-current-box{margin-top:10px;padding:12px;border:1px solid rgba(59,130,246,.24);border-radius:12px;background:rgba(15,23,42,.74)}
+      .wander-current-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+      .wander-current-title{font-size:13px;font-weight:800;line-height:1.5;color:#e2e8f0}
+      .wander-story-theme{font-size:14px;font-weight:800;color:#e2e8f0}
+      .wander-story-premise{margin-top:10px;padding:10px 12px;border-radius:12px;background:rgba(15,23,42,.82);font-size:12px;line-height:1.7;color:#cbd5e1}
+      .wander-story-list{display:flex;flex-direction:column;gap:10px;max-height:420px;overflow:auto;margin-top:10px;padding-right:2px}
+      .wander-entry{border:1px solid rgba(148,163,184,.14);border-radius:12px;padding:12px;background:rgba(15,23,42,.6)}
+      .wander-entry-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+      .wander-entry-title{font-size:13px;font-weight:800;line-height:1.5}
+      .wander-episode-opening,.wander-episode-summary,.wander-episode-result,.wander-episode-reward{margin-top:8px;font-size:12px;line-height:1.7;color:#cbd5e1}
+      .wander-episode-result.is-pending{color:#fcd34d}
+      .wander-episode-reward{color:#93c5fd}
+      .wander-option-list{display:flex;flex-direction:column;gap:6px;margin-top:8px}
+      .wander-option-line{display:grid;grid-template-columns:auto minmax(0,1fr);gap:10px;padding:8px 10px;border-radius:10px;background:rgba(2,6,23,.55);font-size:12px;line-height:1.6;color:#cbd5e1;border:1px solid rgba(148,163,184,.12);text-align:left}
+      button.wander-option-line{width:100%;cursor:pointer;appearance:none;background:rgba(2,6,23,.55)}
+      .wander-option-line.is-preferred{box-shadow:0 0 0 1px rgba(59,130,246,.32) inset}
+      .wander-option-line.is-chosen{background:rgba(22,163,74,.14);color:#bbf7d0}
+      .wander-confirm-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:10px;padding:10px 12px;border-radius:12px;background:rgba(15,23,42,.82)}
+      .wander-confirm-text{font-size:12px;line-height:1.6;color:#cbd5e1}
+      .wander-confirm-hint{font-size:12px;line-height:1.6;color:#94a3b8}
       .import-box{display:none;margin-top:12px;padding:12px;border:1px solid rgba(148,163,184,.16);border-radius:12px;background:rgba(2,6,23,.42)} .import-box.show{display:block}
-      @media (max-width:1100px){.cfg{grid-template-columns:1fr 1fr}.list{grid-template-columns:repeat(auto-fit,minmax(360px,1fr))}.page-layout{grid-template-columns:260px minmax(0,1fr)}}
-      @media (max-width:760px){.page-layout,.cfg,.grid,.stats,.cap,.list,.summary-grid{grid-template-columns:1fr}.side{position:relative}}
-      @media (max-width:640px){.cfg,.grid,.stats,.cap,.list,.summary-grid{grid-template-columns:1fr}.wrap{${IS_PAGE ? 'padding:8px;' : ''}}.panel{${IS_PAGE ? 'min-height:100%;' : `top:8px;${PANEL_SIDE === 'left' ? 'left:8px;' : 'right:8px;'}bottom:8px;width:calc(100vw - 16px);`}}.img{width:100%}}
+      @media (max-width:1100px){.cfg{grid-template-columns:1fr 1fr}.feature-grid{grid-template-columns:1fr 1fr}.list{grid-template-columns:repeat(auto-fit,minmax(360px,1fr))}.page-layout{grid-template-columns:260px minmax(0,1fr)}}
+      @media (max-width:760px){.page-layout,.cfg,.grid,.stats,.cap,.list,.summary-grid,.feature-grid{grid-template-columns:1fr}.side{position:relative}.wander-story-head,.wander-entry-head,.wander-fold,.wander-confirm-bar{flex-direction:column;align-items:flex-start}.wander-fold-side{padding-left:0}}
+      @media (max-width:640px){.cfg,.grid,.stats,.cap,.list,.summary-grid,.feature-grid{grid-template-columns:1fr}.wrap{${IS_PAGE ? 'padding:8px;' : ''}}.panel{${IS_PAGE ? 'min-height:100%;' : `top:8px;${PANEL_SIDE === 'left' ? 'left:8px;' : 'right:8px;'}bottom:8px;width:calc(100vw - 16px);`}}.img{width:100%}}
     `;
   }
 
@@ -2773,6 +3523,7 @@
           资产：${esc(currencyText(a))}<br>
           签到：${esc(signInText(a))}<br>
           月卡：${esc(monthCardText(a))}<br>
+          云游：<span data-side-type="wander" data-id="${esc(a.id)}">${esc(wanderText(a))}</span><br>
           挂机：<span data-side-type="idle" data-id="${esc(a.id)}">${esc(idleText(a.idle, a.idleError))}</span><br>
           秘境：<span data-side-type="dungeon" data-id="${esc(a.id)}">${esc(dungeonShortText(a))}</span><br>
           功法：${esc(cdText(a.technique))}<br>
@@ -2785,7 +3536,7 @@
     const b = loadState(a.id);
     const c = a.character;
     const dungeonRunning = runtime(a.id).dungeonRunning;
-    const anyBatchBusy = UI.signInAllBusy || UI.monthCardClaimAllBusy || UI.sectExchangeAllBusy;
+    const anyBatchBusy = UI.signInAllBusy || UI.monthCardClaimAllBusy || UI.sectExchangeAllBusy || UI.wanderAllBusy;
     const realm = c ? [c.realm, c.subRealm].filter(Boolean).join(' · ') || '未读取' : (a.hasCharacter === false ? '未创建角色' : '未读取');
     const msg = a.lastError || a.lastMessage || '';
     const err = !!a.lastError;
@@ -2814,13 +3565,14 @@
             <button class="btn warn" data-action="remove" data-id="${esc(a.id)}">删除</button>
           </div>
         </div>
-        <div class="grid" style="margin-top:12px">
+        <div class="feature-grid">
           <label>自动秘境（ID）<input data-field="dungeonId" data-id="${esc(a.id)}" value="${esc(a.dungeonId)}" list="dungeonCatalog" placeholder="${esc(dungeonInputPlaceholder())}"></label>
           <label>自动秘境难度<input data-field="dungeonRank" data-id="${esc(a.id)}" type="number" min="1" step="1" value="${esc(Math.max(1, Math.floor(Number(a.dungeonRank) || 1)))}"></label>
         </div>
-        <div class="toolbar">
+        <div class="toolbar daily">
           <button class="btn alt" data-action="signIn" data-id="${esc(a.id)}" ${(b.signIn || !a.token || anyBatchBusy) ? 'disabled' : ''}>${b.signIn ? '签到中...' : '一键签到'}</button>
           <button class="btn alt" data-action="monthCardClaim" data-id="${esc(a.id)}" ${(b.monthCardClaim || !a.token || anyBatchBusy) ? 'disabled' : ''}>${b.monthCardClaim ? '领取中...' : '领取月卡奖励'}</button>
+          <button class="btn alt" data-action="wanderAction" data-id="${esc(a.id)}" ${(b.wanderAction || !a.token || anyBatchBusy) ? 'disabled' : ''}>${wanderActionLabel(a)}</button>
           <button class="btn alt" data-action="idleStart" data-id="${esc(a.id)}" ${(b.idleStart || b.idleStop || !a.token) ? 'disabled' : ''}>${b.idleStart ? '启动挂机中...' : '开始挂机'}</button>
           <button class="btn alt" data-action="idleStop" data-id="${esc(a.id)}" ${(b.idleStop || b.idleStart || !a.token) ? 'disabled' : ''}>${b.idleStop ? '停止中...' : '停止挂机'}</button>
           <button class="btn alt" data-action="sectExchange" data-id="${esc(a.id)}" ${(b.sectExchange || !a.token || anyBatchBusy) ? 'disabled' : ''}>${b.sectExchange ? '兑换中...' : '兑换500残页'}</button>
@@ -2835,12 +3587,14 @@
           ${stat('稀有物品', rareItemsText(a), rareItemsExtra(a), '', a.id)}
           ${stat('签到', signInText(a), signInExtra(a), '', a.id)}
           ${stat('月卡', monthCardText(a), monthCardExtra(a), '', a.id)}
+          ${stat('云游', wanderText(a), wanderExtra(a), 'wander', a.id)}
           ${stat('挂机状态', idleText(a.idle, a.idleError), idleExtra(a.idle, a.idleError, a), 'idle', a.id)}
           ${stat('自动秘境', dungeonText(a), dungeonExtra(a), 'dungeon', a.id)}
           ${stat('自动秘境日志', dungeonLogText(a), dungeonLogExtra(a), '', a.id)}
           ${stat('功法自研冷却', cdText(a.technique), `任务：${esc(job(a.technique?.currentJobStatus))}<br>结果：${esc(job(a.technique?.resultStatus))}<br>到期：${esc(fmtTime(a.technique?.cooldownUntil))}`, 'technique', a.id)}
           ${stat('伙伴招募冷却', cdText(a.partner), `任务：${esc(job(a.partner?.currentJobStatus))}<br>结果：${esc(job(a.partner?.resultStatus))}<br>到期：${esc(fmtTime(a.partner?.cooldownUntil))}`, 'partner', a.id)}
         </div>
+        ${wanderPanelHtml(a)}
       </div>`;
   }
   function render(force = false) {
@@ -2849,6 +3603,7 @@
       UI.pendingRender = true;
       return;
     }
+    rememberScrollPositions();
     UI.pendingRender = false;
     const xs = sortedAccounts();
     const current = selectedAccount(xs);
@@ -2856,7 +3611,7 @@
     const topErrors = [C.error, D.error, UI.noticeError].filter(Boolean).map((msg) => `<div class="msg err" style="margin-top:12px;">${esc(msg)}</div>`).join('');
     const topNotice = UI.noticeMessage ? `<div class="msg" style="margin-top:12px;">${esc(UI.noticeMessage)}</div>` : '';
     const settingsSummary = settingsSummaryText();
-    const anyGlobalBatchBusy = UI.signInAllBusy || UI.monthCardClaimAllBusy || UI.sectExchangeAllBusy;
+    const anyGlobalBatchBusy = UI.signInAllBusy || UI.monthCardClaimAllBusy || UI.sectExchangeAllBusy || UI.wanderAllBusy;
     UI.shadow.innerHTML = `
       <style>${styles()}</style>
       <div class="wrap">
@@ -2875,7 +3630,7 @@
             </div>
             ${UI.settingsOpen ? '' : `<div class="settings-summary">${esc(settingsSummary)}</div>`}
             <div class="settings-box ${UI.settingsOpen ? 'show' : ''}">
-              <p class="sub">接口基于 /captcha/config、/auth/login、/character/check、/signin/overview、/signin/do、/monthcard/status、/monthcard/claim、/idle/status、/idle/config、/dungeon/list、/dungeon/instance/create、/battle-session/start、/battle-session/current、/battle-session/:id/advance、/battle/action、/inventory/items、/character/:id/technique/status、/character/:id/technique/research/status、/partner/recruit/status、/sect/me、/sect/shop、/sect/shop/buy、/sect/donate。已兼容本地图片验证码与腾讯点击验证码；密码只保存在当前页面内存内，不写入 localStorage。</p>
+              <p class="sub">接口基于 /captcha/config、/auth/login、/character/check、/signin/overview、/signin/do、/monthcard/status、/monthcard/claim、/wander/overview、/wander/generate、/wander/choose、/idle/status、/idle/config、/dungeon/list、/dungeon/instance/create、/battle-session/start、/battle-session/current、/battle-session/:id/advance、/battle/action、/inventory/items、/character/:id/technique/status、/character/:id/technique/research/status、/partner/recruit/status、/sect/me、/sect/shop、/sect/shop/buy、/sect/donate。已兼容本地图片验证码与腾讯点击验证码；密码只保存在当前页面内存内，不写入 localStorage。</p>
               <div class="cfg">
                 <label class="wide">API Base<input id="apiBase" value="${esc(S.apiBase)}" placeholder="https://jz.faith.wang/api"></label>
                 <label>自动刷新（分钟，0 关闭）<input id="autoRefresh" type="number" min="0" step="1" value="${esc(S.autoRefreshMinutes)}"></label>
@@ -2893,6 +3648,7 @@
               <button class="btn alt" id="signInAll" ${(anyGlobalBatchBusy || !S.accounts.some((a) => a.token)) ? 'disabled' : ''}>${UI.signInAllBusy ? '全局签到中...' : '全局一键签到'}</button>
               <button class="btn alt" id="monthCardClaimAll" ${(anyGlobalBatchBusy || !S.accounts.some((a) => a.token)) ? 'disabled' : ''}>${UI.monthCardClaimAllBusy ? '全局领取中...' : '全局领取月卡'}</button>
               <button class="btn alt" id="sectExchangeAll" ${(anyGlobalBatchBusy || !S.accounts.some((a) => a.token)) ? 'disabled' : ''}>${UI.sectExchangeAllBusy ? '全局兑换中...' : '全局兑换500残页'}</button>
+              <button class="btn alt" id="wanderAll" ${(anyGlobalBatchBusy || !S.accounts.some((a) => a.token)) ? 'disabled' : ''}>${UI.wanderAllBusy ? '全局云游中...' : '全局一键云游'}</button>
               <button class="btn alt" id="toggleImport">${UI.importOpen ? '收起批量导入' : '批量导入'}</button>
             </div>
             <div class="import-box ${UI.importOpen ? 'show' : ''}">
@@ -2904,7 +3660,7 @@
               </div>
             </div>
           </div>
-          <div class="body">
+          <div class="body" data-scroll-key="main-body">
             ${globalSummaryCards()}
             ${xs.length ? (IS_PAGE
               ? `<div class="page-layout"><aside class="side"><div class="side-title"><span>账号列表</span><span class="side-count">${xs.length} 个账号</span></div><div class="side-list">${xs.map(sideItem).join('')}</div></aside><section class="detail">${current ? card(current, currentIndex) : '<div class="empty">请选择账号</div>'}</section></div>`
@@ -2916,6 +3672,8 @@
         </section>
       </div>`;
     bind();
+    restoreScrollPositions();
+    try { requestAnimationFrame(() => restoreScrollPositions()); } catch {}
     updateCountdowns();
   }
   function bind() {
@@ -2929,6 +3687,7 @@
     s.getElementById('signInAll')?.addEventListener('click', () => { void signInAll(); });
     s.getElementById('monthCardClaimAll')?.addEventListener('click', () => { void claimMonthCardRewardAll(); });
     s.getElementById('sectExchangeAll')?.addEventListener('click', () => { void exchangeSectTechniqueFragmentsAll(); });
+    s.getElementById('wanderAll')?.addEventListener('click', () => { void executeWanderAll(); });
     s.getElementById('toggleImport')?.addEventListener('click', () => { UI.importOpen = !UI.importOpen; render(); });
     s.getElementById('doImport')?.addEventListener('click', () => { void importAccounts(); });
     s.getElementById('clearImport')?.addEventListener('click', () => { UI.importText = ''; render(); });
@@ -2950,7 +3709,20 @@
         render();
       }
     }));
+    s.querySelectorAll('[data-toggle-wander]').forEach((el) => el.addEventListener('click', (e) => {
+      const id = e.currentTarget.getAttribute('data-toggle-wander');
+      if (!id) return;
+      UI.wanderOpenById[id] = UI.wanderOpenById[id] !== true;
+      render();
+    }));
+    s.querySelectorAll('[data-scroll-key]').forEach((el) => el.addEventListener('scroll', (e) => {
+      const key = str(e.currentTarget.getAttribute('data-scroll-key'));
+      if (!key) return;
+      UI.lastScrollAt = Date.now();
+      UI.scrollPositions[key] = Math.max(0, Math.floor(Number(e.currentTarget.scrollTop) || 0));
+    }, { passive: true }));
     s.querySelectorAll('[data-field]').forEach((el) => {
+      if (el.getAttribute('data-field') === 'wanderChoiceDraft') return;
       const handler = (e) => setField(e.target.getAttribute('data-id'), e.target.getAttribute('data-field'), e.target.value);
       el.addEventListener('input', handler);
       el.addEventListener('change', handler);
@@ -2968,6 +3740,17 @@
       else if (action === 'idleStart') await startIdle(id);
       else if (action === 'idleStop') await stopIdle(id);
       else if (action === 'sectExchange') await exchangeSectTechniqueFragments(id);
+      else if (action === 'wanderAction') await executeWander(id);
+      else if (action === 'wanderPick') {
+        const episodeId = e.currentTarget.getAttribute('data-episode-id');
+        const optionIndex = e.currentTarget.getAttribute('data-option-index');
+        if (id && episodeId) {
+          setWanderDraft(id, episodeId, optionIndex);
+          UI.wanderOpenById[id] = true;
+          render(true);
+        }
+      }
+      else if (action === 'wanderConfirm') await confirmWanderChoice(id, e.currentTarget.getAttribute('data-episode-id'));
       else if (action === 'dungeonStart') await startDungeon(id);
       else if (action === 'dungeonStop') stopDungeon(id);
     }));
@@ -2992,7 +3775,9 @@
             ? staminaText(a)
             : type === 'idle'
               ? idleText(a.idle, a.idleError)
-              : dungeonText(a);
+              : type === 'wander'
+                ? wanderText(a)
+                : dungeonText(a);
     });
     UI.shadow.querySelectorAll('[data-side-type]').forEach((el) => {
       const a = acct(el.getAttribute('data-id'));
@@ -3002,7 +3787,9 @@
         ? staminaText(a)
         : type === 'idle'
           ? idleText(a.idle, a.idleError)
-          : dungeonShortText(a);
+          : type === 'wander'
+            ? wanderText(a)
+            : dungeonShortText(a);
     });
   }
   function sched() {
@@ -3044,6 +3831,9 @@
       if (typeof a.signInError !== 'string') a.signInError = '';
       a.monthCard = normalizeMonthCardState(a.monthCard);
       if (typeof a.monthCardError !== 'string') a.monthCardError = '';
+      a.wanderOverview = normalizeWanderOverview(a.wanderOverview);
+      if (typeof a.wanderError !== 'string') a.wanderError = '';
+      a.wanderOptionIndex = normalizeWanderOptionIndex(a.wanderOptionIndex);
       if (typeof a.techniqueNoticeKey !== 'string') a.techniqueNoticeKey = '';
       if (typeof a.partnerNoticeKey !== 'string') a.partnerNoticeKey = '';
     });

@@ -1,5 +1,6 @@
 name: Sync exported source files
 
+# retrigger sync on 2026-04-01
 on:
   push:
     branches:

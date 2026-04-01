@@ -23,6 +23,12 @@
 - 自动刷新全部状态
 - 自动挂机 / 自动续挂
 - 自动秘境
+- 云游状态查看
+- 一键云游：
+  - 单账号
+  - 全局批量
+- 云游详情展开 / 收起
+- 云游当前幕手动选择并确认抉择
 - 一键签到：
   - 单账号
   - 全局批量
@@ -45,6 +51,7 @@
 
 ## Releases
 
+- 最新版本：`v0.8.4`
 - [GitHub Releases](https://github.com/yuai404/jiuzhou-multi-account-status/releases)
 
 ## 快速开始

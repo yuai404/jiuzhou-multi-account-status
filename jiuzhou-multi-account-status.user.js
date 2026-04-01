@@ -1,12 +1,16 @@
 // ==UserScript==
 // @name         九州多账号状态管理
 // @namespace    https://jz.faith.wang/
-// @version      0.6.2
+// @version      0.6.3
 // @description  Bootstrap loader for the full multi-account dashboard script.
 // @author       OpenAI Codex
 // @match        https://jz.faith.wang/*
 // @match        http://localhost:*/*
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @grant        GM.xmlHttpRequest
+// @connect      cdn.jsdelivr.net
+// @connect      raw.githubusercontent.com
+// @connect      unpkg.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -24,13 +28,36 @@
   ];
   const TARGET_FILE = 'jiuzhou-multi-account-status.user.js';
 
+  function gmRequest(details) {
+    if (typeof GM_xmlhttpRequest === 'function') return GM_xmlhttpRequest(details);
+    if (typeof GM === 'object' && typeof GM?.xmlHttpRequest === 'function') return GM.xmlHttpRequest(details);
+    return null;
+  }
+
+  function requestTextOnce(url) {
+    return new Promise((resolve, reject) => {
+      const handled = gmRequest({
+        method: 'GET',
+        url,
+        onload: (response) => resolve(String(response?.responseText || '')),
+        onerror: () => reject(new Error(`请求失败: ${url}`)),
+        ontimeout: () => reject(new Error(`请求超时: ${url}`)),
+      });
+      if (handled) return;
+      fetch(url, { cache: 'no-store' })
+        .then((response) => {
+          if (!response.ok) throw new Error(`${url} -> HTTP ${response.status}`);
+          return response.text();
+        })
+        .then(resolve, reject);
+    });
+  }
+
   async function fetchText(urls) {
     let lastError = null;
     for (const url of urls) {
       try {
-        const response = await fetch(url, { cache: 'no-store' });
-        if (!response.ok) throw new Error(`${url} -> HTTP ${response.status}`);
-        return await response.text();
+        return await requestTextOnce(url);
       } catch (error) {
         lastError = error;
       }
@@ -43,14 +70,8 @@
     let lastError = null;
     for (const url of urls) {
       try {
-        await new Promise((resolve, reject) => {
-          const script = document.createElement('script');
-          script.src = url;
-          script.async = true;
-          script.onload = () => resolve();
-          script.onerror = () => reject(new Error(`加载失败: ${url}`));
-          document.head.appendChild(script);
-        });
+        const source = await requestTextOnce(url);
+        (0, eval)(`${source}\n//# sourceURL=${url}`);
         if (window.fflate?.unzipSync) return window.fflate;
         throw new Error(`库已加载但未暴露 fflate: ${url}`);
       } catch (error) {

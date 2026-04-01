@@ -1,7 +1,7 @@
-﻿// ==UserScript==
+// ==UserScript==
 // @name         九州多账号状态管理
 // @namespace    https://jz.faith.wang/
-// @version      0.6.1
+// @version      0.7.0
 // @description  Multi-account dashboard with stamina countdown, idle, auto-idle, auto-dungeon, currency, rare items, technique and recruit cooldowns.
 // @author       OpenAI Codex
 // @match        https://jz.faith.wang/*
@@ -18,7 +18,9 @@
   const IS_PAGE = LAYOUT_MODE === 'page';
   const PANEL_SIDE = !IS_PAGE && BOOT.side === 'left' ? 'left' : 'right';
   const PANEL_WIDTH = Math.max(420, Math.min(1600, Number(BOOT.panelWidth) || (IS_PAGE ? 1360 : 460)));
+  const SCRIPT_VERSION = str(BOOT.version) || '0.7.0';
   const KEY = 'jzMultiAccountTool:v3';
+  const DEFAULT_MONTH_CARD_ID = 'monthcard-001';
   const JOB = {
     pending: '进行中',
     generated_draft: '待确认',
@@ -73,11 +75,14 @@
     shadow: null,
     tick: 0,
     timer: 0,
+    settingsOpen: BOOT.settingsOpen === true,
     importOpen: false,
     importText: '',
     selectedId: '',
     pendingRender: false,
     pendingAutoRefresh: false,
+    signInAllBusy: false,
+    monthCardClaimAllBusy: false,
     sectExchangeAllBusy: false,
     noticeMessage: '',
     noticeError: '',
@@ -111,6 +116,10 @@
           idleAutoArmed: true,
           technique: a.technique || null,
           partner: a.partner || null,
+          signIn: normalizeSignInState(a.signIn),
+          signInError: str(a.signInError),
+          monthCard: normalizeMonthCardState(a.monthCard),
+          monthCardError: str(a.monthCardError),
           dungeonId: str(a.dungeonId),
           dungeonRank: Math.max(1, Math.floor(Number(a.dungeonRank) || 1)),
           dungeonLastStopReason: str(a.dungeonLastStopReason),
@@ -144,7 +153,7 @@
     return {
       id: uid(), order, alias: '', username: '', token: '', user: null, hasCharacter: null,
       character: null, idle: null, idleError: '', idleConfig: null, idleAutoEnabled: true, idleAutoArmed: true,
-      technique: null, partner: null, dungeonId: '', dungeonRank: 1, dungeonLastStopReason: '', rareItems: emptyRareItems(), inventoryError: '',
+      technique: null, partner: null, signIn: null, signInError: '', monthCard: null, monthCardError: '', dungeonId: '', dungeonRank: 1, dungeonLastStopReason: '', rareItems: emptyRareItems(), inventoryError: '',
       techniqueNoticeKey: '', partnerNoticeKey: '',
       lastLoginAt: '', lastRefreshAt: '', lastError: '', lastMessage: '',
     };
@@ -157,6 +166,10 @@
     a.idleAutoArmed = false;
     a.technique = null;
     a.partner = null;
+    a.signIn = null;
+    a.signInError = '';
+    a.monthCard = null;
+    a.monthCardError = '';
     a.dungeonLastStopReason = '';
     a.rareItems = emptyRareItems();
     a.inventoryError = '';
@@ -196,6 +209,10 @@
       .replace(/'/g, '&#39;');
   }
   function now() { return new Date().toISOString(); }
+  function currentMonthKey() {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  }
   function num(v) { return Math.max(0, Math.floor(Number(v) || 0)).toLocaleString('zh-CN'); }
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.floor(Number(ms) || 0)))); }
   function fmtTime(v) {
@@ -343,6 +360,33 @@
     for (const item of RARE_ITEMS) out[item.key] = Math.max(0, Math.floor(Number(v[item.key]) || 0));
     return out;
   }
+  function normalizeSignInState(v) {
+    if (!v || typeof v !== 'object') return null;
+    return {
+      today: str(v.today),
+      signedToday: v.signedToday === true,
+      month: str(v.month),
+      monthSignedCount: Math.max(0, Math.floor(Number(v.monthSignedCount) || 0)),
+      streakDays: Math.max(0, Math.floor(Number(v.streakDays) || 0)),
+      todayReward: Math.max(0, Math.floor(Number(v.todayReward) || 0)),
+      fetchedAtMs: Math.max(0, Math.floor(Number(v.fetchedAtMs) || 0)),
+    };
+  }
+  function normalizeMonthCardState(v) {
+    if (!v || typeof v !== 'object') return null;
+    return {
+      monthCardId: str(v.monthCardId),
+      name: str(v.name),
+      active: v.active === true,
+      expireAt: str(v.expireAt) || null,
+      daysLeft: Math.max(0, Math.floor(Number(v.daysLeft) || 0)),
+      today: str(v.today),
+      lastClaimDate: str(v.lastClaimDate) || null,
+      canClaim: v.canClaim === true,
+      dailySpiritStones: Math.max(0, Math.floor(Number(v.dailySpiritStones) || 0)),
+      fetchedAtMs: Math.max(0, Math.floor(Number(v.fetchedAtMs) || 0)),
+    };
+  }
   function normalizeAutoSkillPolicy(v) {
     const slots = Array.isArray(v?.slots) ? v.slots : [];
     return { slots: slots.map((slot) => ({ skillId: str(slot?.skillId ?? slot?.skill_id), priority: Math.max(0, Math.floor(Number(slot?.priority) || 0)) })).filter((slot) => slot.skillId) };
@@ -382,6 +426,10 @@
     if (S.autoRefreshMinutes <= 0) return '已关闭';
     return str(S.lastAutoRefreshAt) ? fmtTime(S.lastAutoRefreshAt) : '尚未自动刷新';
   }
+  function settingsSummaryText() {
+    const autoRefreshText = S.autoRefreshMinutes > 0 ? `每 ${S.autoRefreshMinutes} 分钟` : '已关闭';
+    return `版本 v${SCRIPT_VERSION} · 自动刷新 ${autoRefreshText} · 验证码 ${providerName()} · API ${S.apiBase}`;
+  }
   function globalSummaryCards() {
     return `
       <div class="summary-grid">
@@ -401,6 +449,52 @@
     if (a.inventoryError) return `稀有物品读取失败：${esc(a.inventoryError)}`;
     const items = normalizeRareItems(a.rareItems);
     return RARE_ITEMS.map((item) => `${esc(item.label)}：${esc(num(items[item.key]))}`).join('<br>');
+  }
+  function signInText(a) {
+    if (!a?.character) return a?.hasCharacter === false ? '未创建角色' : '未读取';
+    if (a.signInError) return a.signInError === '接口未部署' ? '暂不可用' : '读取失败';
+    const st = normalizeSignInState(a.signIn);
+    if (!st) return '未读取';
+    return st.signedToday ? '今日已签到' : '今日未签到';
+  }
+  function signInExtra(a) {
+    if (!a?.character) return a?.hasCharacter === false ? '账号已登录，但尚未创建角色' : '未读取';
+    if (a.signInError) return `签到状态读取失败：${esc(a.signInError)}`;
+    const st = normalizeSignInState(a.signIn);
+    if (!st) return '未读取';
+    const lines = [
+      `月份：${esc(st.month || currentMonthKey())}`,
+      `本月已签：${esc(num(st.monthSignedCount))} 天`,
+      `连续签到：${esc(num(st.streakDays))} 天`,
+    ];
+    lines.push(st.signedToday
+      ? `今日状态：已签到${st.todayReward > 0 ? ` · 获得 ${esc(num(st.todayReward))} 灵石` : ''}`
+      : '今日状态：尚未签到');
+    return lines.join('<br>');
+  }
+  function monthCardText(a) {
+    if (!a?.character) return a?.hasCharacter === false ? '未创建角色' : '未读取';
+    if (a.monthCardError) return a.monthCardError === '接口未部署' ? '暂不可用' : '读取失败';
+    const st = normalizeMonthCardState(a.monthCard);
+    if (!st) return '未读取';
+    if (!st.active) return st.expireAt ? '已到期' : '未激活';
+    if (st.canClaim) return '可领奖励';
+    return st.today && st.lastClaimDate === st.today ? '今日已领取' : '生效中';
+  }
+  function monthCardExtra(a) {
+    if (!a?.character) return a?.hasCharacter === false ? '账号已登录，但尚未创建角色' : '未读取';
+    if (a.monthCardError) return `月卡状态读取失败：${esc(a.monthCardError)}`;
+    const st = normalizeMonthCardState(a.monthCard);
+    if (!st) return '未读取';
+    const lines = [`每日奖励：${esc(num(st.dailySpiritStones))} 灵石`];
+    if (!st.active) {
+      lines.push(st.expireAt ? `状态：已到期（${esc(fmtTime(st.expireAt))}）` : '状态：未激活');
+      return lines.join('<br>');
+    }
+    lines.push(`状态：生效中 · 剩余 ${esc(num(st.daysLeft))} 天`);
+    lines.push(`到期：${esc(fmtTime(st.expireAt))}`);
+    lines.push(st.canClaim ? '今日奖励：可领取' : `今日奖励：${st.today && st.lastClaimDate === st.today ? '已领取' : '暂不可领'}`);
+    return lines.join('<br>');
   }
   function idleConfigReady(cfg) { return !!(cfg && cfg.mapId && cfg.roomId && cfg.targetMonsterDefId && cfg.maxDurationMs > 0); }
   function idleConfigSummary(cfg) { return cfg ? `${cfg.mapId || '?'} / ${cfg.roomId || '?'} / ${cfg.targetMonsterDefId || '?'} / ${dur(Math.floor(cfg.maxDurationMs / 1000), '0秒')}` : '未读取'; }
@@ -631,7 +725,7 @@
   function loadState(id) {
     if (!L.has(id)) L.set(id, {});
     const state = L.get(id);
-    ['captcha', 'login', 'refresh', 'idleStart', 'idleStop', 'dungeonStart', 'sectExchange'].forEach((key) => {
+    ['captcha', 'login', 'refresh', 'idleStart', 'idleStop', 'dungeonStart', 'sectExchange', 'signIn', 'monthCardClaim'].forEach((key) => {
       if (typeof state[key] !== 'boolean') state[key] = false;
     });
     return state;
@@ -1553,6 +1647,14 @@
     return counts;
   }
 
+  async function readSignInOverview(token, month = currentMonthKey()) {
+    const q = new URLSearchParams({ month: str(month) || currentMonthKey() });
+    return (await api(`/signin/overview?${q.toString()}`, { token }))?.data || null;
+  }
+  async function readMonthCardStatus(token, monthCardId = DEFAULT_MONTH_CARD_ID) {
+    const q = new URLSearchParams({ monthCardId: str(monthCardId) || DEFAULT_MONTH_CARD_ID });
+    return (await api(`/monthcard/status?${q.toString()}`, { token }))?.data || null;
+  }
   async function readIdleConfig(token) {
     return normalizeIdleConfig((await api('/idle/config', { token }))?.data?.config);
   }
@@ -1665,6 +1767,243 @@
     setBusy(id, 'idleStop', false);
     save();
     render();
+  }
+  async function signInOnce(id, { fromGlobal = false } = {}) {
+    const a = acct(id);
+    if (!a) return { success: false, skipped: true, message: '账号不存在' };
+    if (!a.token) {
+      setMsg(a, '', '请先登录账号');
+      render();
+      return { success: false, skipped: true, message: '未登录' };
+    }
+    const state = loadState(id);
+    if (state.signIn || state.monthCardClaim || state.refresh || state.login) {
+      return { success: false, skipped: true, message: '账号正忙' };
+    }
+    setBusy(id, 'signIn', true);
+    setMsg(a, fromGlobal ? '全局签到中...' : '签到中...', '');
+    render();
+    try {
+      const overview = await readSignInOverview(a.token);
+      a.signIn = normalizeSignInState({
+        ...(overview || {}),
+        todayReward: Math.max(0, Math.floor(Number(overview?.records?.[overview?.today]?.reward) || 0)),
+        fetchedAtMs: Date.now(),
+      });
+      a.signInError = '';
+      if (overview?.signedToday) {
+        setMsg(a, '今日已签到', '');
+        save();
+        render();
+        return { success: true, skipped: true, already: true, reward: 0, message: '今日已签到' };
+      }
+      const res = await api('/signin/do', { method: 'POST', token: a.token });
+      const reward = Math.max(0, Math.floor(Number(res?.data?.reward) || 0));
+      await refresh(id, true);
+      setMsg(a, `签到成功，获得 ${num(reward)} 灵石`, '');
+      save();
+      render();
+      return { success: true, reward };
+    } catch (e) {
+      const message = (typeof e?.message === 'string' ? e.message : String(e || '')).trim() || '未知错误';
+      if (Number(e?.status) === 401) {
+        a.token = '';
+        a.user = null;
+        a.hasCharacter = null;
+        clearCharacterState(a);
+        setMsg(a, '', '登录状态已失效，请重新登录');
+        save();
+        render();
+        return { success: false, message: '登录状态已失效，请重新登录' };
+      }
+      if (/今日已签到/.test(message)) {
+        try {
+          const overview = await readSignInOverview(a.token);
+          a.signIn = normalizeSignInState({
+            ...(overview || {}),
+            todayReward: Math.max(0, Math.floor(Number(overview?.records?.[overview?.today]?.reward) || 0)),
+            fetchedAtMs: Date.now(),
+          });
+          a.signInError = '';
+        } catch {}
+        setMsg(a, '今日已签到', '');
+        save();
+        render();
+        return { success: true, skipped: true, already: true, reward: 0, message: '今日已签到' };
+      }
+      setMsg(a, '', `签到失败：${message}`);
+      save();
+      render();
+      return { success: false, message };
+    } finally {
+      setBusy(id, 'signIn', false);
+      save();
+      render();
+    }
+  }
+  async function signInAll() {
+    const ids = S.accounts.filter((a) => a.token).map((a) => a.id);
+    if (!ids.length) {
+      setGlobalNotice('', '没有可执行签到的已登录账号');
+      render();
+      return;
+    }
+    if (UI.signInAllBusy) return;
+    UI.signInAllBusy = true;
+    setGlobalNotice(`全局签到中：${ids.length} 个账号`, '');
+    render();
+    let success = 0;
+    let failed = 0;
+    let skipped = 0;
+    let already = 0;
+    let totalReward = 0;
+    try {
+      for (const id of ids) {
+        const result = await signInOnce(id, { fromGlobal: true });
+        if (result?.success) {
+          if (result.already) already += 1;
+          else if (result.skipped) skipped += 1;
+          else success += 1;
+          totalReward += Math.max(0, Math.floor(Number(result.reward) || 0));
+        } else if (result?.skipped) {
+          skipped += 1;
+        } else {
+          failed += 1;
+        }
+      }
+      setGlobalNotice(`全局签到完成：成功 ${success}，已签到 ${already}，跳过 ${skipped}，失败 ${failed}，共获得 ${num(totalReward)} 灵石`, '');
+    } catch (e) {
+      setGlobalNotice('', `全局签到失败：${e.message || e}`);
+    } finally {
+      UI.signInAllBusy = false;
+      render();
+    }
+  }
+  async function claimMonthCardRewardOnce(id, { fromGlobal = false } = {}) {
+    const a = acct(id);
+    if (!a) return { success: false, skipped: true, message: '账号不存在' };
+    if (!a.token) {
+      setMsg(a, '', '请先登录账号');
+      render();
+      return { success: false, skipped: true, message: '未登录' };
+    }
+    const state = loadState(id);
+    if (state.monthCardClaim || state.signIn || state.refresh || state.login) {
+      return { success: false, skipped: true, message: '账号正忙' };
+    }
+    setBusy(id, 'monthCardClaim', true);
+    setMsg(a, fromGlobal ? '全局领取月卡中...' : '领取月卡中...', '');
+    render();
+    try {
+      const status = await readMonthCardStatus(a.token, DEFAULT_MONTH_CARD_ID);
+      a.monthCard = normalizeMonthCardState({ ...(status || {}), fetchedAtMs: Date.now() });
+      a.monthCardError = '';
+      if (!status?.active) {
+        const message = status?.expireAt ? '月卡已到期' : '未激活月卡';
+        setMsg(a, message, '');
+        save();
+        render();
+        return { success: true, skipped: true, inactive: true, reward: 0, message };
+      }
+      if (!status?.canClaim) {
+        const message = status?.today && status?.lastClaimDate === status?.today ? '今日月卡奖励已领取' : '当前无可领取月卡奖励';
+        setMsg(a, message, '');
+        save();
+        render();
+        return { success: true, skipped: true, already: true, reward: 0, message };
+      }
+      const res = await api('/monthcard/claim', {
+        method: 'POST',
+        token: a.token,
+        body: { monthCardId: DEFAULT_MONTH_CARD_ID },
+      });
+      const reward = Math.max(0, Math.floor(Number(res?.data?.rewardSpiritStones) || 0));
+      await refresh(id, true);
+      setMsg(a, `月卡奖励领取成功，获得 ${num(reward)} 灵石`, '');
+      save();
+      render();
+      return { success: true, reward };
+    } catch (e) {
+      const message = (typeof e?.message === 'string' ? e.message : String(e || '')).trim() || '未知错误';
+      if (Number(e?.status) === 401) {
+        a.token = '';
+        a.user = null;
+        a.hasCharacter = null;
+        clearCharacterState(a);
+        setMsg(a, '', '登录状态已失效，请重新登录');
+        save();
+        render();
+        return { success: false, message: '登录状态已失效，请重新登录' };
+      }
+      if (/今日已领取/.test(message)) {
+        try {
+          const status = await readMonthCardStatus(a.token, DEFAULT_MONTH_CARD_ID);
+          a.monthCard = normalizeMonthCardState({ ...(status || {}), fetchedAtMs: Date.now() });
+          a.monthCardError = '';
+        } catch {}
+        setMsg(a, '今日月卡奖励已领取', '');
+        save();
+        render();
+        return { success: true, skipped: true, already: true, reward: 0, message: '今日月卡奖励已领取' };
+      }
+      if (/未激活月卡|月卡已到期/.test(message)) {
+        try {
+          const status = await readMonthCardStatus(a.token, DEFAULT_MONTH_CARD_ID);
+          a.monthCard = normalizeMonthCardState({ ...(status || {}), fetchedAtMs: Date.now() });
+          a.monthCardError = '';
+        } catch {}
+        setMsg(a, message, '');
+        save();
+        render();
+        return { success: true, skipped: true, inactive: true, reward: 0, message };
+      }
+      setMsg(a, '', `领取月卡失败：${message}`);
+      save();
+      render();
+      return { success: false, message };
+    } finally {
+      setBusy(id, 'monthCardClaim', false);
+      save();
+      render();
+    }
+  }
+  async function claimMonthCardRewardAll() {
+    const ids = S.accounts.filter((a) => a.token).map((a) => a.id);
+    if (!ids.length) {
+      setGlobalNotice('', '没有可执行月卡领取的已登录账号');
+      render();
+      return;
+    }
+    if (UI.monthCardClaimAllBusy) return;
+    UI.monthCardClaimAllBusy = true;
+    setGlobalNotice(`全局领取月卡中：${ids.length} 个账号`, '');
+    render();
+    let success = 0;
+    let failed = 0;
+    let skipped = 0;
+    let already = 0;
+    let totalReward = 0;
+    try {
+      for (const id of ids) {
+        const result = await claimMonthCardRewardOnce(id, { fromGlobal: true });
+        if (result?.success) {
+          if (result.already) already += 1;
+          else if (result.skipped) skipped += 1;
+          else success += 1;
+          totalReward += Math.max(0, Math.floor(Number(result.reward) || 0));
+        } else if (result?.skipped) {
+          skipped += 1;
+        } else {
+          failed += 1;
+        }
+      }
+      setGlobalNotice(`全局月卡领取完成：成功 ${success}，已领取/不可领 ${already + skipped}，失败 ${failed}，共获得 ${num(totalReward)} 灵石`, '');
+    } catch (e) {
+      setGlobalNotice('', `全局月卡领取失败：${e.message || e}`);
+    } finally {
+      UI.monthCardClaimAllBusy = false;
+      render();
+    }
   }
   async function exchangeSectTechniqueFragments(id, { fromGlobal = false } = {}) {
     const a = acct(id);
@@ -2158,12 +2497,14 @@
           spiritStones: Math.max(0, Math.floor(Number(c.spirit_stones ?? c.spiritStones) || 0)),
           silver: Math.max(0, Math.floor(Number(c.silver) || 0)),
         };
-        const [tr, pr, ir, icr, rr] = await Promise.allSettled([
+        const [tr, pr, ir, icr, rr, sr, mr] = await Promise.allSettled([
           api(`/character/${cid}/technique/research/status`, { token: a.token }),
           api('/partner/recruit/status', { token: a.token }),
           api('/idle/status', { token: a.token }),
           readIdleConfig(a.token),
           fetchRareItems(a.token),
+          readSignInOverview(a.token),
+          readMonthCardStatus(a.token, DEFAULT_MONTH_CARD_ID),
         ]);
         if (tr.status === 'rejected') throw tr.reason;
         if (pr.status === 'rejected') throw pr.reason;
@@ -2202,12 +2543,33 @@
           a.rareItems = emptyRareItems();
           a.inventoryError = str(rr.reason?.message || rr.reason) || '读取失败';
         }
+        if (sr.status === 'fulfilled') {
+          const sd = sr.value || {};
+          a.signIn = normalizeSignInState({
+            ...sd,
+            todayReward: Math.max(0, Math.floor(Number(sd?.records?.[sd?.today]?.reward) || 0)),
+            fetchedAtMs: Date.now(),
+          });
+          a.signInError = '';
+        } else {
+          a.signIn = null;
+          a.signInError = Number(sr.reason?.status) === 404 ? '接口未部署' : (str(sr.reason?.message || sr.reason) || '读取失败');
+        }
+        if (mr.status === 'fulfilled') {
+          a.monthCard = normalizeMonthCardState({ ...(mr.value || {}), fetchedAtMs: Date.now() });
+          a.monthCardError = '';
+        } else {
+          a.monthCard = null;
+          a.monthCardError = Number(mr.reason?.status) === 404 ? '接口未部署' : (str(mr.reason?.message || mr.reason) || '读取失败');
+        }
         a.idleAutoEnabled = true;
         a.idleAutoArmed = true;
         a.lastRefreshAt = now();
         const notes = [];
         if (a.idleError) notes.push(`挂机状态：${a.idleError}`);
         if (a.inventoryError) notes.push(`背包：${a.inventoryError}`);
+        if (a.signInError) notes.push(`签到：${a.signInError}`);
+        if (a.monthCardError) notes.push(`月卡：${a.monthCardError}`);
         setMsg(a, notes.length ? `状态刷新成功（${notes.join('；')}）` : '状态刷新成功', '');
       }
     } catch (e) {
@@ -2331,8 +2693,14 @@
       .fab{display:${IS_PAGE ? 'none' : 'block'};pointer-events:auto;position:fixed;${PANEL_SIDE === 'left' ? 'left:18px;' : 'right:18px;'}bottom:18px;border:0;border-radius:999px;padding:12px 16px;background:#2563eb;color:#fff;font-weight:700;cursor:pointer;box-shadow:0 10px 28px rgba(37,99,235,.35)}
       .panel{pointer-events:auto;${IS_PAGE ? 'position:relative;top:auto;left:auto;right:auto;bottom:auto;width:100%;min-height:100%;' : `position:fixed;top:12px;${PANEL_SIDE === 'left' ? 'left:12px;' : 'right:12px;'}bottom:12px;width:min(${PANEL_WIDTH}px,calc(100vw - 24px));transform:${PANEL_SIDE === 'left' ? 'translateX(calc(-100% - 18px))' : 'translateX(calc(100% + 18px))'};`}background:rgba(9,14,24,.97);border:1px solid rgba(148,163,184,.2);border-radius:16px;overflow:hidden;display:flex;flex-direction:column;transition:transform .2s ease}
       .panel.open{transform:translateX(0)} .hd{padding:14px 16px;border-bottom:1px solid rgba(148,163,184,.15)} .hd1{display:flex;justify-content:space-between;align-items:center;gap:10px}
+      .head-left,.head-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
       .title{margin:0;font-size:${IS_PAGE ? '24px' : '18px'};font-weight:800} .sub{margin:8px 0 0;font-size:12px;line-height:1.5;color:#94a3b8}
-      .x{display:${IS_PAGE ? 'none' : 'block'};border:0;background:rgba(148,163,184,.14);color:#e2e8f0;border-radius:10px;padding:8px 10px;cursor:pointer;font-weight:700}
+      .version-badge{display:inline-flex;align-items:center;justify-content:center;padding:3px 8px;border-radius:999px;background:rgba(37,99,235,.18);color:#93c5fd;font-size:11px;font-weight:800}
+      .settings-summary{margin-top:8px;font-size:12px;line-height:1.6;color:#94a3b8}
+      .x,.toggle{display:inline-flex;align-items:center;justify-content:center;border:0;background:rgba(148,163,184,.14);color:#e2e8f0;border-radius:10px;padding:8px 10px;cursor:pointer;font-weight:700}
+      .x{display:${IS_PAGE ? 'none' : 'inline-flex'}}
+      .settings-box{display:none}
+      .settings-box.show{display:block}
       .cfg,.grid,.stats,.summary-grid{display:grid;gap:10px} .cfg{grid-template-columns:${IS_PAGE ? 'repeat(4,minmax(0,1fr))' : '1fr 1fr'};margin-top:12px} .cfg .wide{grid-column:1 / -1} .grid,.stats{grid-template-columns:1fr 1fr} .summary-grid{grid-template-columns:${IS_PAGE ? 'repeat(3,minmax(0,1fr))' : '1fr'};margin:12px 0 0}
       .body{flex:1;overflow:auto;padding:${IS_PAGE ? '16px' : '12px'};background:rgba(2,6,23,.65)} .list{display:${IS_PAGE ? 'grid' : 'flex'};${IS_PAGE ? 'grid-template-columns:repeat(auto-fit,minmax(420px,1fr));align-items:start;' : 'flex-direction:column;'}gap:${IS_PAGE ? '16px' : '12px'}}
       .page-layout{display:grid;grid-template-columns:minmax(260px,320px) minmax(0,1fr);gap:16px;align-items:start}
@@ -2403,6 +2771,8 @@
           用户名：${esc(a.username || '—')}<br>
           体力：<span data-side-type="stamina" data-id="${esc(a.id)}">${esc(staminaText(a))}</span><br>
           资产：${esc(currencyText(a))}<br>
+          签到：${esc(signInText(a))}<br>
+          月卡：${esc(monthCardText(a))}<br>
           挂机：<span data-side-type="idle" data-id="${esc(a.id)}">${esc(idleText(a.idle, a.idleError))}</span><br>
           秘境：<span data-side-type="dungeon" data-id="${esc(a.id)}">${esc(dungeonShortText(a))}</span><br>
           功法：${esc(cdText(a.technique))}<br>
@@ -2415,6 +2785,7 @@
     const b = loadState(a.id);
     const c = a.character;
     const dungeonRunning = runtime(a.id).dungeonRunning;
+    const anyBatchBusy = UI.signInAllBusy || UI.monthCardClaimAllBusy || UI.sectExchangeAllBusy;
     const realm = c ? [c.realm, c.subRealm].filter(Boolean).join(' · ') || '未读取' : (a.hasCharacter === false ? '未创建角色' : '未读取');
     const msg = a.lastError || a.lastMessage || '';
     const err = !!a.lastError;
@@ -2448,9 +2819,11 @@
           <label>自动秘境难度<input data-field="dungeonRank" data-id="${esc(a.id)}" type="number" min="1" step="1" value="${esc(Math.max(1, Math.floor(Number(a.dungeonRank) || 1)))}"></label>
         </div>
         <div class="toolbar">
+          <button class="btn alt" data-action="signIn" data-id="${esc(a.id)}" ${(b.signIn || !a.token || anyBatchBusy) ? 'disabled' : ''}>${b.signIn ? '签到中...' : '一键签到'}</button>
+          <button class="btn alt" data-action="monthCardClaim" data-id="${esc(a.id)}" ${(b.monthCardClaim || !a.token || anyBatchBusy) ? 'disabled' : ''}>${b.monthCardClaim ? '领取中...' : '领取月卡奖励'}</button>
           <button class="btn alt" data-action="idleStart" data-id="${esc(a.id)}" ${(b.idleStart || b.idleStop || !a.token) ? 'disabled' : ''}>${b.idleStart ? '启动挂机中...' : '开始挂机'}</button>
           <button class="btn alt" data-action="idleStop" data-id="${esc(a.id)}" ${(b.idleStop || b.idleStart || !a.token) ? 'disabled' : ''}>${b.idleStop ? '停止中...' : '停止挂机'}</button>
-          <button class="btn alt" data-action="sectExchange" data-id="${esc(a.id)}" ${(b.sectExchange || !a.token || UI.sectExchangeAllBusy) ? 'disabled' : ''}>${b.sectExchange ? '兑换中...' : '兑换500残页'}</button>
+          <button class="btn alt" data-action="sectExchange" data-id="${esc(a.id)}" ${(b.sectExchange || !a.token || anyBatchBusy) ? 'disabled' : ''}>${b.sectExchange ? '兑换中...' : '兑换500残页'}</button>
           <button class="btn" data-action="dungeonStart" data-id="${esc(a.id)}" ${(b.dungeonStart || !a.token) ? 'disabled' : ''}>${b.dungeonStart ? '自动秘境中...' : '开始自动秘境'}</button>
           <button class="btn warn" data-action="dungeonStop" data-id="${esc(a.id)}" ${!dungeonRunning ? 'disabled' : ''}>停止自动秘境</button>
         </div>
@@ -2460,6 +2833,8 @@
           ${stat('体力', staminaText(a), staminaExtra(a), 'stamina', a.id)}
           ${stat('灵石 / 银两', currencyText(a), currencyExtra(a), '', a.id)}
           ${stat('稀有物品', rareItemsText(a), rareItemsExtra(a), '', a.id)}
+          ${stat('签到', signInText(a), signInExtra(a), '', a.id)}
+          ${stat('月卡', monthCardText(a), monthCardExtra(a), '', a.id)}
           ${stat('挂机状态', idleText(a.idle, a.idleError), idleExtra(a.idle, a.idleError, a), 'idle', a.id)}
           ${stat('自动秘境', dungeonText(a), dungeonExtra(a), 'dungeon', a.id)}
           ${stat('自动秘境日志', dungeonLogText(a), dungeonLogExtra(a), '', a.id)}
@@ -2480,6 +2855,8 @@
     const currentIndex = current ? Math.max(0, xs.findIndex((a) => a.id === current.id)) : 0;
     const topErrors = [C.error, D.error, UI.noticeError].filter(Boolean).map((msg) => `<div class="msg err" style="margin-top:12px;">${esc(msg)}</div>`).join('');
     const topNotice = UI.noticeMessage ? `<div class="msg" style="margin-top:12px;">${esc(UI.noticeMessage)}</div>` : '';
+    const settingsSummary = settingsSummaryText();
+    const anyGlobalBatchBusy = UI.signInAllBusy || UI.monthCardClaimAllBusy || UI.sectExchangeAllBusy;
     UI.shadow.innerHTML = `
       <style>${styles()}</style>
       <div class="wrap">
@@ -2487,24 +2864,35 @@
         <section class="panel ${UI.open ? 'open' : ''}">
           <div class="hd">
             <div class="hd1">
-              <h2 class="title">九州多账号状态管理</h2>
-              <button class="x" id="close">关闭</button>
+              <div class="head-left">
+                <h2 class="title">九州多账号状态管理</h2>
+                <span class="version-badge">v${esc(SCRIPT_VERSION)}</span>
+              </div>
+              <div class="head-actions">
+                <button class="toggle" id="toggleSettings">${UI.settingsOpen ? '收起设置' : '展开设置'}</button>
+                <button class="x" id="close">关闭</button>
+              </div>
             </div>
-            <p class="sub">接口基于 /captcha/config、/auth/login、/character/check、/idle/status、/idle/config、/dungeon/list、/dungeon/instance/create、/battle-session/start、/battle-session/current、/battle-session/:id/advance、/battle/action、/inventory/items、/character/:id/technique/status、/character/:id/technique/research/status、/partner/recruit/status、/sect/me、/sect/shop、/sect/shop/buy、/sect/donate。已兼容本地图片验证码与腾讯点击验证码；密码只保存在当前页面内存，不写入 localStorage。</p>
-            <div class="cfg">
-              <label class="wide">API Base<input id="apiBase" value="${esc(S.apiBase)}" placeholder="https://jz.faith.wang/api"></label>
-              <label>自动刷新（分钟，0 关闭）<input id="autoRefresh" type="number" min="0" step="1" value="${esc(S.autoRefreshMinutes)}"></label>
-              <label>排序方式<select id="sortBy"><option value="manual" ${S.sortBy === 'manual' ? 'selected' : ''}>手动顺序</option><option value="name" ${S.sortBy === 'name' ? 'selected' : ''}>名称</option><option value="technique" ${S.sortBy === 'technique' ? 'selected' : ''}>功法自研剩余</option><option value="partner" ${S.sortBy === 'partner' ? 'selected' : ''}>伙伴招募剩余</option><option value="stamina_desc" ${S.sortBy === 'stamina_desc' ? 'selected' : ''}>体力高到低</option><option value="stamina_asc" ${S.sortBy === 'stamina_asc' ? 'selected' : ''}>体力低到高</option></select></label>
-              <label>冷却完成提醒<span class="inline"><input id="notifyEnabled" type="checkbox" ${S.notifyEnabled ? 'checked' : ''}> 启用浏览器提醒</span></label>
-              <label>通知权限<div class="inline" style="justify-content:space-between;"><span class="perm">${esc(notifyText())}</span><button class="btn alt" id="notifyBtn" type="button">请求授权</button></div></label>
-              <label class="wide">验证码模式<div class="inline" style="justify-content:space-between;"><span class="perm">${esc(providerName())}：${esc(providerHint())}</span><button class="btn alt" id="reloadCaptchaConfig" type="button" ${C.loading ? 'disabled' : ''}>${C.loading ? '读取中...' : '刷新模式'}</button></div></label>
+            ${UI.settingsOpen ? '' : `<div class="settings-summary">${esc(settingsSummary)}</div>`}
+            <div class="settings-box ${UI.settingsOpen ? 'show' : ''}">
+              <p class="sub">接口基于 /captcha/config、/auth/login、/character/check、/signin/overview、/signin/do、/monthcard/status、/monthcard/claim、/idle/status、/idle/config、/dungeon/list、/dungeon/instance/create、/battle-session/start、/battle-session/current、/battle-session/:id/advance、/battle/action、/inventory/items、/character/:id/technique/status、/character/:id/technique/research/status、/partner/recruit/status、/sect/me、/sect/shop、/sect/shop/buy、/sect/donate。已兼容本地图片验证码与腾讯点击验证码；密码只保存在当前页面内存内，不写入 localStorage。</p>
+              <div class="cfg">
+                <label class="wide">API Base<input id="apiBase" value="${esc(S.apiBase)}" placeholder="https://jz.faith.wang/api"></label>
+                <label>自动刷新（分钟，0 关闭）<input id="autoRefresh" type="number" min="0" step="1" value="${esc(S.autoRefreshMinutes)}"></label>
+                <label>排序方式<select id="sortBy"><option value="manual" ${S.sortBy === 'manual' ? 'selected' : ''}>手动顺序</option><option value="name" ${S.sortBy === 'name' ? 'selected' : ''}>名称</option><option value="technique" ${S.sortBy === 'technique' ? 'selected' : ''}>功法自研剩余</option><option value="partner" ${S.sortBy === 'partner' ? 'selected' : ''}>伙伴招募剩余</option><option value="stamina_desc" ${S.sortBy === 'stamina_desc' ? 'selected' : ''}>体力高到低</option><option value="stamina_asc" ${S.sortBy === 'stamina_asc' ? 'selected' : ''}>体力低到高</option></select></label>
+                <label>冷却完成提醒<span class="inline"><input id="notifyEnabled" type="checkbox" ${S.notifyEnabled ? 'checked' : ''}> 启用浏览器提醒</span></label>
+                <label>通知权限<div class="inline" style="justify-content:space-between;"><span class="perm">${esc(notifyText())}</span><button class="btn alt" id="notifyBtn" type="button">请求授权</button></div></label>
+                <label class="wide">验证码模式<div class="inline" style="justify-content:space-between;"><span class="perm">${esc(providerName())}：${esc(providerHint())}</span><button class="btn alt" id="reloadCaptchaConfig" type="button" ${C.loading ? 'disabled' : ''}>${C.loading ? '读取中...' : '刷新模式'}</button></div></label>
+              </div>
             </div>
             ${topErrors}
             ${topNotice}
             <div class="toolbar">
               <button class="btn" id="add">新增账号</button>
               <button class="btn alt" id="all">刷新全部状态</button>
-              <button class="btn alt" id="sectExchangeAll" ${(UI.sectExchangeAllBusy || !S.accounts.some((a) => a.token)) ? 'disabled' : ''}>${UI.sectExchangeAllBusy ? '全局兑换中...' : '全局兑换500残页'}</button>
+              <button class="btn alt" id="signInAll" ${(anyGlobalBatchBusy || !S.accounts.some((a) => a.token)) ? 'disabled' : ''}>${UI.signInAllBusy ? '全局签到中...' : '全局一键签到'}</button>
+              <button class="btn alt" id="monthCardClaimAll" ${(anyGlobalBatchBusy || !S.accounts.some((a) => a.token)) ? 'disabled' : ''}>${UI.monthCardClaimAllBusy ? '全局领取中...' : '全局领取月卡'}</button>
+              <button class="btn alt" id="sectExchangeAll" ${(anyGlobalBatchBusy || !S.accounts.some((a) => a.token)) ? 'disabled' : ''}>${UI.sectExchangeAllBusy ? '全局兑换中...' : '全局兑换500残页'}</button>
               <button class="btn alt" id="toggleImport">${UI.importOpen ? '收起批量导入' : '批量导入'}</button>
             </div>
             <div class="import-box ${UI.importOpen ? 'show' : ''}">
@@ -2535,8 +2923,11 @@
     if (!s) return;
     s.getElementById('fab')?.addEventListener('click', () => { UI.open = !UI.open; render(); });
     s.getElementById('close')?.addEventListener('click', () => { UI.open = false; render(); });
+    s.getElementById('toggleSettings')?.addEventListener('click', () => { UI.settingsOpen = !UI.settingsOpen; render(); });
     s.getElementById('add')?.addEventListener('click', () => add());
     s.getElementById('all')?.addEventListener('click', () => { void refreshAll(); });
+    s.getElementById('signInAll')?.addEventListener('click', () => { void signInAll(); });
+    s.getElementById('monthCardClaimAll')?.addEventListener('click', () => { void claimMonthCardRewardAll(); });
     s.getElementById('sectExchangeAll')?.addEventListener('click', () => { void exchangeSectTechniqueFragmentsAll(); });
     s.getElementById('toggleImport')?.addEventListener('click', () => { UI.importOpen = !UI.importOpen; render(); });
     s.getElementById('doImport')?.addEventListener('click', () => { void importAccounts(); });
@@ -2570,6 +2961,8 @@
       if (action === 'captcha') await refreshCaptcha(id);
       else if (action === 'login') await login(id);
       else if (action === 'refresh') await refresh(id);
+      else if (action === 'signIn') await signInOnce(id);
+      else if (action === 'monthCardClaim') await claimMonthCardRewardOnce(id);
       else if (action === 'logout') logout(id);
       else if (action === 'remove') remove(id);
       else if (action === 'idleStart') await startIdle(id);
@@ -2647,6 +3040,10 @@
       if (typeof a.dungeonLastStopReason !== 'string') a.dungeonLastStopReason = '';
       a.rareItems = normalizeRareItems(a.rareItems);
       if (typeof a.inventoryError !== 'string') a.inventoryError = '';
+      a.signIn = normalizeSignInState(a.signIn);
+      if (typeof a.signInError !== 'string') a.signInError = '';
+      a.monthCard = normalizeMonthCardState(a.monthCard);
+      if (typeof a.monthCardError !== 'string') a.monthCardError = '';
       if (typeof a.techniqueNoticeKey !== 'string') a.techniqueNoticeKey = '';
       if (typeof a.partnerNoticeKey !== 'string') a.partnerNoticeKey = '';
     });

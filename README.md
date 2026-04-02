@@ -35,7 +35,6 @@
 ## 文件
 
 - [`jiuzhou-multi-account-status.user.js`](./jiuzhou-multi-account-status.user.js)：Tampermonkey 脚本版
-- [`index.html`](./index.html)：独立 HTML 版
 
 ## Releases
 
@@ -44,7 +43,7 @@
 
 ## 快速开始
 
-### Tampermonkey（推荐）
+### Tampermonkey
 
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/)
 2. 安装脚本：
@@ -56,12 +55,6 @@
 > 当前 `@match`：
 > - `https://jz.faith.wang/*`
 > - `http://localhost:*/*`
-
-### 独立 HTML
-
-1. 打开 [`index.html`](./index.html)
-2. 默认 API Base：`https://jz.faith.wang/api`
-3. 如果本地 HTML 遇到跨域 / CSP / 腾讯验证码 SDK 限制，请改用 Tampermonkey 版
 
 ## 批量导入格式
 
@@ -105,8 +98,7 @@
 
 ## 说明
 
-- 推荐优先使用 Tampermonkey 版
+- 当前仅维护 Tampermonkey 脚本版
 - 自动挂机依赖服务端已有挂机配置
 - 自动秘境依赖可用秘境 ID、有效 token 与正常战斗会话
-- HTML 版的 AI 请求可能受浏览器跨域限制
 - 同一账号在别处登录后，旧 token 可能失效

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         九州多账号状态管理
 // @namespace    https://jz.faith.wang/
-// @version      0.8.4
+// @version      0.8.5
 // @description  Multi-account dashboard with stamina countdown, idle, auto-idle, auto-dungeon, currency, rare items, technique and recruit cooldowns.
 // @author       OpenAI Codex
 // @match        https://jz.faith.wang/*
@@ -18,7 +18,7 @@
   const IS_PAGE = LAYOUT_MODE === 'page';
   const PANEL_SIDE = !IS_PAGE && BOOT.side === 'left' ? 'left' : 'right';
   const PANEL_WIDTH = Math.max(420, Math.min(1600, Number(BOOT.panelWidth) || (IS_PAGE ? 1360 : 460)));
-  const SCRIPT_VERSION = str(BOOT.version) || '0.8.4';
+  const SCRIPT_VERSION = str(BOOT.version) || '0.8.5';
   const KEY = 'jzMultiAccountTool:v3';
   const DEFAULT_MONTH_CARD_ID = 'monthcard-001';
   const JOB = {
@@ -87,7 +87,6 @@
     signInAllBusy: false,
     monthCardClaimAllBusy: false,
     sectExchangeAllBusy: false,
-    wanderAllBusy: false,
     noticeMessage: '',
     noticeError: '',
     wanderOpenById: Object.create(null),
@@ -387,12 +386,13 @@
     return lines.join('<br>');
   }
   function emptyRareItems() {
-    return { monthCard: 0, insightToken: 0, recruitToken: 0, renameCard: 0 };
+    return { monthCard: 0, insightToken: 0, recruitToken: 0, renameCard: 0, sectFragment: 0 };
   }
   function normalizeRareItems(v) {
     const out = emptyRareItems();
     if (!v || typeof v !== 'object') return out;
     for (const item of RARE_ITEMS) out[item.key] = Math.max(0, Math.floor(Number(v[item.key]) || 0));
+    out.sectFragment = Math.max(0, Math.floor(Number(v.sectFragment) || 0));
     return out;
   }
   function normalizeSignInState(v) {
@@ -541,10 +541,18 @@
   }
   function currentSpiritStones(a) { return Math.max(0, Math.floor(Number(a?.character?.spiritStones ?? a?.character?.spirit_stones) || 0)); }
   function currentSilver(a) { return Math.max(0, Math.floor(Number(a?.character?.silver) || 0)); }
+  function currentSectFragments(a) { return Math.max(0, Math.floor(Number(a?.rareItems?.sectFragment) || 0)); }
   function currencyText(a) { return a?.character ? `灵石 ${num(currentSpiritStones(a))} · 银两 ${num(currentSilver(a))}` : '未读取'; }
   function currencyExtra(a) { return a?.character ? `灵石：${esc(num(currentSpiritStones(a)))}<br>银两：${esc(num(currentSilver(a)))}` : '未读取'; }
   function totalSpiritStones() { return S.accounts.reduce((sum, a) => sum + currentSpiritStones(a), 0); }
   function totalSilver() { return S.accounts.reduce((sum, a) => sum + currentSilver(a), 0); }
+  function totalSectFragments() { return S.accounts.reduce((sum, a) => sum + currentSectFragments(a), 0); }
+  function totalSectFragmentsText() { return `功法残页 ${num(totalSectFragments())}`; }
+  function totalSectFragmentsExtra() {
+    const total = totalSectFragments();
+    const holders = S.accounts.filter((a) => currentSectFragments(a) > 0).length;
+    return `总数量：${esc(num(total))}<br>有残页账号：${esc(num(holders))}`;
+  }
   function totalRareItems() {
     const out = emptyRareItems();
     for (const a of S.accounts) {
@@ -616,6 +624,7 @@
       <div class="summary-grid">
         ${summaryCard('全局灵石 / 银两', `灵石 ${esc(num(totalSpiritStones()))} · 银两 ${esc(num(totalSilver()))}`, '')}
         ${summaryCard('全局稀有物品', esc(totalRareItemsText()), totalRareItemsExtra())}
+        ${summaryCard('全局功法残页', esc(totalSectFragmentsText()), totalSectFragmentsExtra())}
         ${summaryCard('全局云游', esc(globalWanderSummaryText()), globalWanderSummaryExtra())}
         ${summaryCard('上次自动刷新', esc(lastAutoRefreshText()), S.autoRefreshMinutes > 0 ? `当前频率：每 ${esc(S.autoRefreshMinutes)} 分钟` : '自动刷新已关闭')}
       </div>`;
@@ -631,6 +640,16 @@
     if (a.inventoryError) return `稀有物品读取失败：${esc(a.inventoryError)}`;
     const items = normalizeRareItems(a.rareItems);
     return RARE_ITEMS.map((item) => `${esc(item.label)}：${esc(num(items[item.key]))}`).join('<br>');
+  }
+  function sectFragmentText(a) {
+    if (!a?.character) return a?.hasCharacter === false ? '\u672a\u521b\u5efa\u89d2\u8272' : '\u672a\u8bfb\u53d6';
+    if (a.inventoryError) return '\u8bfb\u53d6\u5931\u8d25';
+    return `\u529f\u6cd5\u6b8b\u9875 ${num(currentSectFragments(a))}`;
+  }
+  function sectFragmentExtra(a) {
+    if (!a?.character) return a?.hasCharacter === false ? '\u8d26\u53f7\u5df2\u767b\u5f55\uff0c\u4f46\u5c1a\u672a\u521b\u5efa\u89d2\u8272' : '\u672a\u8bfb\u53d6';
+    if (a.inventoryError) return `\u529f\u6cd5\u6b8b\u9875\u8bfb\u53d6\u5931\u8d25\uff1a${esc(a.inventoryError)}`;
+    return `\u5f53\u524d\u6570\u91cf\uff1a${esc(num(currentSectFragments(a)))}`;
   }
   function signInText(a) {
     if (!a?.character) return a?.hasCharacter === false ? '未创建角色' : '未读取';
@@ -2077,9 +2096,14 @@
     const counts = emptyRareItems();
     for (const row of [...bagItems, ...warehouseItems]) {
       const defId = str(row?.item_def_id ?? row?.itemDefId);
+      const qty = Math.max(0, Math.floor(Number(row?.qty) || 0));
+      if (defId === SECT_FRAGMENT_ITEM_DEF_ID) {
+        counts.sectFragment += qty;
+        continue;
+      }
       const rare = RARE_ITEM_BY_DEF_ID.get(defId);
       if (!rare) continue;
-      counts[rare.key] += Math.max(0, Math.floor(Number(row?.qty) || 0));
+      counts[rare.key] += qty;
     }
     return counts;
   }
@@ -2660,46 +2684,6 @@
     } finally {
       setBusy(id, 'wanderAction', false);
       save();
-      render();
-    }
-  }
-  async function executeWanderAll() {
-    const ids = S.accounts.filter((a) => a.token).map((a) => a.id);
-    if (!ids.length) {
-      setGlobalNotice('', '没有可执行云游的已登录账号');
-      render();
-      return;
-    }
-    if (UI.wanderAllBusy) return;
-    UI.wanderAllBusy = true;
-    setGlobalNotice(`全局云游中：${ids.length} 个账号`, '');
-    render();
-    let success = 0;
-    let failed = 0;
-    let cooling = 0;
-    let pending = 0;
-    let needConfirm = 0;
-    let skipped = 0;
-    try {
-      for (const id of ids) {
-        const result = await executeWander(id, { fromGlobal: true });
-        if (result?.success) {
-          if (result.pendingChoice) needConfirm += 1;
-          else if (result.ready) success += 1;
-          else if (result.cooling) cooling += 1;
-          else if (result.pending) pending += 1;
-          else skipped += 1;
-        } else if (result?.skipped) {
-          skipped += 1;
-        } else {
-          failed += 1;
-        }
-      }
-      setGlobalNotice(`全局云游完成：已开启/刷新 ${success}，待手动确认 ${needConfirm}，冷却中 ${cooling}，生成中 ${pending}，跳过 ${skipped}，失败 ${failed}`, '');
-    } catch (e) {
-      setGlobalNotice('', `全局云游失败：${e.message || e}`);
-    } finally {
-      UI.wanderAllBusy = false;
       render();
     }
   }
@@ -3536,7 +3520,7 @@
     const b = loadState(a.id);
     const c = a.character;
     const dungeonRunning = runtime(a.id).dungeonRunning;
-    const anyBatchBusy = UI.signInAllBusy || UI.monthCardClaimAllBusy || UI.sectExchangeAllBusy || UI.wanderAllBusy;
+    const anyBatchBusy = UI.signInAllBusy || UI.monthCardClaimAllBusy || UI.sectExchangeAllBusy;
     const realm = c ? [c.realm, c.subRealm].filter(Boolean).join(' · ') || '未读取' : (a.hasCharacter === false ? '未创建角色' : '未读取');
     const msg = a.lastError || a.lastMessage || '';
     const err = !!a.lastError;
@@ -3585,6 +3569,7 @@
           ${stat('体力', staminaText(a), staminaExtra(a), 'stamina', a.id)}
           ${stat('灵石 / 银两', currencyText(a), currencyExtra(a), '', a.id)}
           ${stat('稀有物品', rareItemsText(a), rareItemsExtra(a), '', a.id)}
+          ${stat('功法残页', sectFragmentText(a), sectFragmentExtra(a), '', a.id)}
           ${stat('签到', signInText(a), signInExtra(a), '', a.id)}
           ${stat('月卡', monthCardText(a), monthCardExtra(a), '', a.id)}
           ${stat('云游', wanderText(a), wanderExtra(a), 'wander', a.id)}
@@ -3611,7 +3596,7 @@
     const topErrors = [C.error, D.error, UI.noticeError].filter(Boolean).map((msg) => `<div class="msg err" style="margin-top:12px;">${esc(msg)}</div>`).join('');
     const topNotice = UI.noticeMessage ? `<div class="msg" style="margin-top:12px;">${esc(UI.noticeMessage)}</div>` : '';
     const settingsSummary = settingsSummaryText();
-    const anyGlobalBatchBusy = UI.signInAllBusy || UI.monthCardClaimAllBusy || UI.sectExchangeAllBusy || UI.wanderAllBusy;
+    const anyGlobalBatchBusy = UI.signInAllBusy || UI.monthCardClaimAllBusy || UI.sectExchangeAllBusy;
     UI.shadow.innerHTML = `
       <style>${styles()}</style>
       <div class="wrap">
@@ -3648,7 +3633,6 @@
               <button class="btn alt" id="signInAll" ${(anyGlobalBatchBusy || !S.accounts.some((a) => a.token)) ? 'disabled' : ''}>${UI.signInAllBusy ? '全局签到中...' : '全局一键签到'}</button>
               <button class="btn alt" id="monthCardClaimAll" ${(anyGlobalBatchBusy || !S.accounts.some((a) => a.token)) ? 'disabled' : ''}>${UI.monthCardClaimAllBusy ? '全局领取中...' : '全局领取月卡'}</button>
               <button class="btn alt" id="sectExchangeAll" ${(anyGlobalBatchBusy || !S.accounts.some((a) => a.token)) ? 'disabled' : ''}>${UI.sectExchangeAllBusy ? '全局兑换中...' : '全局兑换500残页'}</button>
-              <button class="btn alt" id="wanderAll" ${(anyGlobalBatchBusy || !S.accounts.some((a) => a.token)) ? 'disabled' : ''}>${UI.wanderAllBusy ? '全局云游中...' : '全局一键云游'}</button>
               <button class="btn alt" id="toggleImport">${UI.importOpen ? '收起批量导入' : '批量导入'}</button>
             </div>
             <div class="import-box ${UI.importOpen ? 'show' : ''}">
@@ -3687,7 +3671,6 @@
     s.getElementById('signInAll')?.addEventListener('click', () => { void signInAll(); });
     s.getElementById('monthCardClaimAll')?.addEventListener('click', () => { void claimMonthCardRewardAll(); });
     s.getElementById('sectExchangeAll')?.addEventListener('click', () => { void exchangeSectTechniqueFragmentsAll(); });
-    s.getElementById('wanderAll')?.addEventListener('click', () => { void executeWanderAll(); });
     s.getElementById('toggleImport')?.addEventListener('click', () => { UI.importOpen = !UI.importOpen; render(); });
     s.getElementById('doImport')?.addEventListener('click', () => { void importAccounts(); });
     s.getElementById('clearImport')?.addEventListener('click', () => { UI.importText = ''; render(); });

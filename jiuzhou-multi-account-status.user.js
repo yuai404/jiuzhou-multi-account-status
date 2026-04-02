@@ -792,15 +792,14 @@
   function currentSilver(a) { return Math.max(0, Math.floor(Number(a?.character?.silver) || 0)); }
   function currentSectFragments(a) { return Math.max(0, Math.floor(Number(a?.rareItems?.sectFragment) || 0)); }
   function currencyText(a) { return a?.character ? `灵石 ${num(currentSpiritStones(a))} · 银两 ${num(currentSilver(a))}` : '未读取'; }
-  function currencyExtra(a) { return a?.character ? `灵石：${esc(num(currentSpiritStones(a)))}<br>银两：${esc(num(currentSilver(a)))}` : '未读取'; }
+  function currencyExtra(a) { return ''; }
   function totalSpiritStones() { return S.accounts.reduce((sum, a) => sum + currentSpiritStones(a), 0); }
   function totalSilver() { return S.accounts.reduce((sum, a) => sum + currentSilver(a), 0); }
   function totalSectFragments() { return S.accounts.reduce((sum, a) => sum + currentSectFragments(a), 0); }
   function totalSectFragmentsText() { return `功法残页 ${num(totalSectFragments())}`; }
   function totalSectFragmentsExtra() {
-    const total = totalSectFragments();
     const holders = S.accounts.filter((a) => currentSectFragments(a) > 0).length;
-    return `总数量：${esc(num(total))}<br>有残页账号：${esc(num(holders))}`;
+    return holders > 0 ? `有残页账号：${esc(num(holders))}` : '';
   }
   function totalRareItems() {
     const out = emptyRareItems();
@@ -816,7 +815,8 @@
   }
   function totalRareItemsExtra() {
     const items = totalRareItems();
-    return RARE_ITEMS.map((item) => `${esc(item.label)}：${esc(num(items[item.key]))}`).join('<br>');
+    const activeKinds = RARE_ITEMS.filter((item) => Number(items[item.key]) > 0).length;
+    return activeKinds > 0 ? `已持有 ${esc(num(activeKinds))} 类稀有物品` : '';
   }
   function lastAutoRefreshText() {
     if (S.autoRefreshMinutes <= 0) return '已关闭';
@@ -885,10 +885,11 @@
     return RARE_ITEMS.map((item) => `${item.label} ${num(items[item.key])}`).join(' · ');
   }
   function rareItemsExtra(a) {
-    if (!a?.character) return '未读取';
+    if (!a?.character) return '';
     if (a.inventoryError) return `稀有物品读取失败：${esc(a.inventoryError)}`;
     const items = normalizeRareItems(a.rareItems);
-    return RARE_ITEMS.map((item) => `${esc(item.label)}：${esc(num(items[item.key]))}`).join('<br>');
+    const activeKinds = RARE_ITEMS.filter((item) => Number(items[item.key]) > 0).length;
+    return activeKinds > 0 ? `已持有 ${esc(num(activeKinds))} 类稀有物品` : '';
   }
   function sectFragmentText(a) {
     if (!a?.character) return a?.hasCharacter === false ? '\u672a\u521b\u5efa\u89d2\u8272' : '\u672a\u8bfb\u53d6';
@@ -896,9 +897,9 @@
     return `\u529f\u6cd5\u6b8b\u9875 ${num(currentSectFragments(a))}`;
   }
   function sectFragmentExtra(a) {
-    if (!a?.character) return a?.hasCharacter === false ? '\u8d26\u53f7\u5df2\u767b\u5f55\uff0c\u4f46\u5c1a\u672a\u521b\u5efa\u89d2\u8272' : '\u672a\u8bfb\u53d6';
+    if (!a?.character) return '';
     if (a.inventoryError) return `\u529f\u6cd5\u6b8b\u9875\u8bfb\u53d6\u5931\u8d25\uff1a${esc(a.inventoryError)}`;
-    return `\u5f53\u524d\u6570\u91cf\uff1a${esc(num(currentSectFragments(a)))}`;
+    return '';
   }
   function signInText(a) {
     if (!a?.character) return a?.hasCharacter === false ? '未创建角色' : '未读取';
@@ -4185,7 +4186,7 @@
     return `<div class="st"><div class="sl">${esc(label)}</div><div class="sv" ${type ? `data-type="${esc(type)}" data-id="${esc(id)}"` : ''}>${esc(value)}</div><div class="sx">${extra || '—'}</div></div>`;
   }
   function summaryCard(label, value, extra = '') {
-    return `<div class="summary-card"><div class="label">${esc(label)}</div><div class="value">${value}</div><div class="extra">${extra || '—'}</div></div>`;
+    return `<div class="summary-card"><div class="label">${esc(label)}</div><div class="value">${value}</div>${extra ? `<div class="extra">${extra}</div>` : ''}</div>`;
   }
   function sideStatusPill(label, value, type, id) {
     const valueHtml = type ? `<span data-side-type="${esc(type)}" data-id="${esc(id)}">${esc(value)}</span>` : esc(value);
@@ -4231,7 +4232,7 @@
     return `<span class="account-status-pill"><span class="account-status-pill-label">${esc(label)}</span>${valueHtml}</span>`;
   }
   function compactAccountStat(label, value, extra = '') {
-    return `<div class="compact-stat"><div class="compact-stat-label">${esc(label)}</div><div class="compact-stat-value">${esc(value)}</div><div class="compact-stat-extra">${extra || '—'}</div></div>`;
+    return `<div class="compact-stat"><div class="compact-stat-label">${esc(label)}</div><div class="compact-stat-value">${esc(value)}</div>${extra ? `<div class="compact-stat-extra">${extra}</div>` : ''}</div>`;
   }
 
   function captchaFieldHtml(a, t) {

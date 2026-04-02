@@ -1,25 +1,34 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         九州多账号状态管理
 // @namespace    https://jz.faith.wang/
-// @version      0.8.5
+// @version      0.9
 // @description  Multi-account dashboard with stamina countdown, idle, auto-idle, auto-dungeon, currency, rare items, technique and recruit cooldowns.
 // @author       OpenAI Codex
 // @match        https://jz.faith.wang/*
 // @match        http://localhost:*/*
-// @grant        none
+// @grant        unsafeWindow
+// @grant        GM_xmlhttpRequest
+// @connect      *
 // @run-at       document-idle
 // ==/UserScript==
 
 (() => {
   'use strict';
 
-  const BOOT = window.__JZ_MULTI_ACCOUNT_TOOL_CONFIG__ || {};
+  const PAGE = (() => {
+    try { return typeof unsafeWindow !== 'undefined' && unsafeWindow ? unsafeWindow : window; } catch { return window; }
+  })();
+  const STORAGE = (() => {
+    try { return PAGE.localStorage || window.localStorage; } catch { return window.localStorage; }
+  })();
+  const BOOT = PAGE.__JZ_MULTI_ACCOUNT_TOOL_CONFIG__ || {};
   const LAYOUT_MODE = BOOT.layout === 'page' ? 'page' : 'drawer';
   const IS_PAGE = LAYOUT_MODE === 'page';
   const PANEL_SIDE = !IS_PAGE && BOOT.side === 'left' ? 'left' : 'right';
-  const PANEL_WIDTH = Math.max(420, Math.min(1600, Number(BOOT.panelWidth) || (IS_PAGE ? 1360 : 460)));
-  const SCRIPT_VERSION = str(BOOT.version) || '0.8.5';
+  const PANEL_WIDTH = Math.max(420, Math.min(1600, Number(BOOT.panelWidth) || (IS_PAGE ? 1360 : 1260)));
+  const SCRIPT_VERSION = str(BOOT.version) || '0.9';
   const KEY = 'jzMultiAccountTool:v3';
+  const AI_STORAGE_KEY = `${KEY}:ai`;
   const DEFAULT_MONTH_CARD_ID = 'monthcard-001';
   const JOB = {
     pending: '进行中',
@@ -57,6 +66,9 @@
   const WANDER_OPTION_COUNT = 3;
   const WANDER_PENDING_JOB_POLL_INTERVAL_MS = 2000;
   const WANDER_PENDING_JOB_MAX_POLLS = 45;
+  const WANDER_AI_REQUEST_TIMEOUT_MS = 25000;
+  const WANDER_AI_RETRY_COOLDOWN_MS = 30000;
+  const WANDER_AI_MAX_HISTORY_EPISODES = 3;
   const DUNGEON_TYPE_LABELS = { material: '材料', equipment: '装备', trial: '试炼', challenge: '挑战', event: '活动' };
   const RARE_ITEMS = [
     { key: 'monthCard', label: '修行月卡', itemDefId: 'cons-monthcard-001' },
@@ -87,20 +99,38 @@
     signInAllBusy: false,
     monthCardClaimAllBusy: false,
     sectExchangeAllBusy: false,
+    wanderAllBusy: false,
+    wanderAutoAllBusy: false,
+    idleAllBusy: false,
     noticeMessage: '',
     noticeError: '',
+    accountSettingsOpenById: Object.create(null),
     wanderOpenById: Object.create(null),
     wanderChoiceDraftById: Object.create(null),
+    wanderAutoBusyById: Object.create(null),
     scrollPositions: Object.create(null),
     lastScrollAt: 0,
   };
   const C = { loaded: false, loading: true, provider: 'local', tencentAppId: 0, error: '', sdkLoading: false };
   const D = { loaded: false, loading: false, error: '', list: [], fetchedAt: 0 };
+  const AI = {
+    loading: false,
+    ready: false,
+    error: '',
+    source: '',
+    apiKey: '',
+    model: '',
+    openaiUrl: '',
+    anthropicUrl: '',
+    lastLoadedAt: '',
+    draft: loadAiConfigDraft(),
+    promise: null,
+  };
   let sdkPromise = null;
   let socketIoPromise = null;
   function load() {
     try {
-      const raw = JSON.parse(localStorage.getItem(KEY) || '{}');
+      const raw = JSON.parse(STORAGE.getItem(KEY) || '{}');
       return {
         apiBase: normBase(raw.apiBase),
         autoRefreshMinutes: Number.isFinite(Number(raw.autoRefreshMinutes)) ? Math.max(0, Math.floor(Number(raw.autoRefreshMinutes))) : 5,
@@ -130,6 +160,11 @@
           wanderOverview: normalizeWanderOverview(a.wanderOverview),
           wanderError: str(a.wanderError),
           wanderOptionIndex: normalizeWanderOptionIndex(a.wanderOptionIndex),
+          wanderAutoEnabled: a.wanderAutoEnabled === true,
+          wanderAutoLastAt: str(a.wanderAutoLastAt),
+          wanderAutoError: str(a.wanderAutoError),
+          wanderAutoPendingEpisodeId: str(a.wanderAutoPendingEpisodeId),
+          wanderAutoLastChoice: str(a.wanderAutoLastChoice),
           dungeonId: str(a.dungeonId),
           dungeonRank: Math.max(1, Math.floor(Number(a.dungeonRank) || 1)),
           dungeonLastStopReason: str(a.dungeonLastStopReason),
@@ -149,7 +184,7 @@
   }
 
   function save() {
-    localStorage.setItem(KEY, JSON.stringify({
+    STORAGE.setItem(KEY, JSON.stringify({
       apiBase: S.apiBase,
       autoRefreshMinutes: S.autoRefreshMinutes,
       lastAutoRefreshAt: S.lastAutoRefreshAt,
@@ -163,7 +198,7 @@
     return {
       id: uid(), order, alias: '', username: '', token: '', user: null, hasCharacter: null,
       character: null, idle: null, idleError: '', idleConfig: null, idleAutoEnabled: true, idleAutoArmed: true,
-          technique: null, partner: null, signIn: null, signInError: '', monthCard: null, monthCardError: '', wanderOverview: null, wanderError: '', wanderOptionIndex: 0, dungeonId: '', dungeonRank: 1, dungeonLastStopReason: '', rareItems: emptyRareItems(), inventoryError: '',
+          technique: null, partner: null, signIn: null, signInError: '', monthCard: null, monthCardError: '', wanderOverview: null, wanderError: '', wanderOptionIndex: 0, wanderAutoEnabled: false, wanderAutoLastAt: '', wanderAutoError: '', wanderAutoPendingEpisodeId: '', wanderAutoLastChoice: '', dungeonId: '', dungeonRank: 1, dungeonLastStopReason: '', rareItems: emptyRareItems(), inventoryError: '',
       techniqueNoticeKey: '', partnerNoticeKey: '',
       lastLoginAt: '', lastRefreshAt: '', lastError: '', lastMessage: '',
     };
@@ -182,6 +217,10 @@
     a.monthCardError = '';
     a.wanderOverview = null;
     a.wanderError = '';
+    a.wanderAutoLastAt = '';
+    a.wanderAutoError = '';
+    a.wanderAutoPendingEpisodeId = '';
+    a.wanderAutoLastChoice = '';
     a.dungeonLastStopReason = '';
     a.rareItems = emptyRareItems();
     a.inventoryError = '';
@@ -210,7 +249,217 @@
       return String(location.origin || '').replace(/\/+$/, '');
     }
   }
-  function pageToken() { return str(localStorage.getItem('token')); }
+  function normRemoteBase(v) {
+    return str(v).replace(/\/+$/, '');
+  }
+  function normalizeAiConfig(input) {
+    if (!input || typeof input !== 'object') return null;
+    const pick = (...keys) => {
+      for (const key of keys) {
+        if (key in input && str(input[key])) return str(input[key]);
+      }
+      return '';
+    };
+    const apiKey = pick('apiKey', 'APIKey', 'api_key', 'key');
+    const model = pick('model', 'modelId', 'model_id');
+    const openaiUrl = normRemoteBase(pick('openaiUrl', 'openai_url', 'baseUrl', 'base_url', 'url'));
+    const anthropicUrl = normRemoteBase(pick('anthropicUrl', 'anthropic_url'));
+    if (!apiKey && !model && !openaiUrl && !anthropicUrl) return null;
+    return { apiKey, model, openaiUrl, anthropicUrl };
+  }
+  function emptyAiConfig() {
+    return { apiKey: '', model: '', openaiUrl: '', anthropicUrl: '' };
+  }
+  function mergeAiConfig(...sources) {
+    const out = emptyAiConfig();
+    sources.forEach((source) => {
+      const cfg = normalizeAiConfig(source);
+      if (!cfg) return;
+      if (str(cfg.apiKey)) out.apiKey = str(cfg.apiKey);
+      if (str(cfg.model)) out.model = str(cfg.model);
+      if (str(cfg.openaiUrl)) out.openaiUrl = normRemoteBase(cfg.openaiUrl);
+      if (str(cfg.anthropicUrl)) out.anthropicUrl = normRemoteBase(cfg.anthropicUrl);
+    });
+    return out;
+  }
+  function loadAiConfigDraft() {
+    try {
+      return mergeAiConfig(JSON.parse(STORAGE.getItem(AI_STORAGE_KEY) || 'null'));
+    } catch (error) {
+      try { console.warn('[JZ Multi] 读取 AI 配置失败', error); } catch {}
+      return emptyAiConfig();
+    }
+  }
+  function saveAiConfigDraft(config) {
+    AI.draft = mergeAiConfig(config);
+    try {
+      if (AI.draft.apiKey || AI.draft.model || AI.draft.openaiUrl || AI.draft.anthropicUrl) {
+        STORAGE.setItem(AI_STORAGE_KEY, JSON.stringify(AI.draft));
+      } else {
+        STORAGE.removeItem(AI_STORAGE_KEY);
+      }
+    } catch (error) {
+      try { console.warn('[JZ Multi] 保存 AI 配置失败', error); } catch {}
+    }
+    return AI.draft;
+  }
+  function clearAiRuntime(message = '') {
+    AI.ready = false;
+    AI.apiKey = '';
+    AI.model = '';
+    AI.openaiUrl = '';
+    AI.anthropicUrl = '';
+    AI.source = '';
+    AI.error = str(message);
+    AI.lastLoadedAt = '';
+  }
+  function applyAiConfig(config, source) {
+    AI.apiKey = str(config?.apiKey);
+    AI.model = str(config?.model);
+    AI.openaiUrl = normRemoteBase(config?.openaiUrl);
+    AI.anthropicUrl = normRemoteBase(config?.anthropicUrl);
+    AI.source = str(source);
+    AI.error = '';
+    AI.ready = !!(AI.apiKey && AI.model && AI.openaiUrl);
+    AI.lastLoadedAt = now();
+    AI.draft = mergeAiConfig(AI.draft, config);
+    return AI;
+  }
+  async function ensureAiConfig(force = false) {
+    if (!force && AI.ready) return AI;
+    if (!force && AI.loading && AI.promise) return AI.promise;
+    AI.loading = true;
+    AI.promise = (async () => {
+      const bootConfig = normalizeAiConfig(BOOT.aiConfig || BOOT.ai || null);
+      const pageConfig = mergeAiConfig(AI.draft);
+      const merged = mergeAiConfig(bootConfig, pageConfig);
+      if (merged.apiKey && merged.model && merged.openaiUrl) {
+        const source = pageConfig.apiKey || pageConfig.model || pageConfig.openaiUrl || pageConfig.anthropicUrl
+          ? (bootConfig ? '页面输入 + 默认配置' : '页面输入')
+          : 'BOOT.aiConfig';
+        return applyAiConfig(merged, source);
+      }
+      const missing = [];
+      if (!merged.apiKey) missing.push('AI Key');
+      if (!merged.model) missing.push('Model');
+      if (!merged.openaiUrl) missing.push('OpenAI URL');
+      clearAiRuntime(`请在设置中填写 ${missing.join(' / ')}`);
+      return AI;
+    })().finally(() => {
+      AI.loading = false;
+      renderWhenSafe();
+    });
+    return AI.promise;
+  }
+  function aiStatusText() {
+    if (AI.loading) return '校验中...';
+    if (AI.ready) return `已就绪 · ${AI.model}`;
+    if (AI.error) return /^请在设置中填写\s+/u.test(AI.error) ? '未配置' : AI.error;
+    return '未配置';
+  }
+  function aiStatusExtra() {
+    const lines = [];
+    if (AI.source) lines.push(`来源：${esc(AI.source)}`);
+    if (AI.openaiUrl) lines.push(`OpenAI URL：${esc(AI.openaiUrl)}`);
+    if (AI.anthropicUrl) lines.push(`Anthropic URL：${esc(AI.anthropicUrl)}`);
+    if (AI.lastLoadedAt) lines.push(`最近校验：${esc(fmtTime(AI.lastLoadedAt))}`);
+    if (AI.error) lines.push(`错误：${esc(AI.error)}`);
+    return lines.join('<br>') || '请在页面内填写 AI Key / Model / OpenAI URL，已保存到浏览器本地。';
+  }
+  function aiDraftValue(field) {
+    return str(AI.draft?.[field]) || str(AI[field]);
+  }
+  function updateAiDraftField(field, value) {
+    const next = { ...AI.draft };
+    next[field] = field === 'openaiUrl' || field === 'anthropicUrl' ? normRemoteBase(value) : str(value);
+    saveAiConfigDraft(next);
+    return AI.draft;
+  }
+  function readAiDraftFromDom() {
+    const s = UI.shadow;
+    if (!s) return AI.draft;
+    return saveAiConfigDraft({
+      apiKey: str(s.getElementById('aiApiKey')?.value),
+      model: str(s.getElementById('aiModel')?.value),
+      openaiUrl: normRemoteBase(s.getElementById('aiOpenaiUrl')?.value),
+      anthropicUrl: normRemoteBase(s.getElementById('aiAnthropicUrl')?.value),
+    });
+  }
+  async function applyAiDraftConfig() {
+    readAiDraftFromDom();
+    await ensureAiConfig(true);
+    renderWhenSafe();
+  }
+  function clearAiDraftConfig() {
+    saveAiConfigDraft(emptyAiConfig());
+    clearAiRuntime('请在设置中填写 AI Key / Model / OpenAI URL');
+    renderWhenSafe();
+  }
+  function openAiChatUrl() {
+    const base = normRemoteBase(AI.openaiUrl);
+    if (!base) return '';
+    if (/\/chat\/completions$/i.test(base)) return base;
+    if (/\/responses$/i.test(base)) return base;
+    return `${base}/chat/completions`;
+  }
+  function isCrossOriginUrl(url) {
+    try { return new URL(url, location.href).origin !== location.origin; } catch { return false; }
+  }
+  function gmRequester() {
+    if (typeof GM_xmlhttpRequest === 'function') return GM_xmlhttpRequest;
+    if (typeof GM === 'object' && typeof GM?.xmlHttpRequest === 'function') return GM.xmlHttpRequest.bind(GM);
+    return null;
+  }
+  async function requestTextWithOptionalGm(url, options = {}, timeoutMs = WANDER_AI_REQUEST_TIMEOUT_MS) {
+    const target = new URL(url, location.href).toString();
+    const useGm = isCrossOriginUrl(target) && !!gmRequester();
+    if (useGm) {
+      const requester = gmRequester();
+      return await new Promise((resolve, reject) => {
+        requester({
+          method: str(options.method || 'GET') || 'GET',
+          url: target,
+          headers: options.headers || {},
+          data: options.body,
+          timeout: Math.max(1000, Math.floor(Number(timeoutMs) || WANDER_AI_REQUEST_TIMEOUT_MS)),
+          responseType: 'text',
+          anonymous: false,
+          onload: (res) => resolve({ ok: res.status >= 200 && res.status < 300, status: Number(res.status) || 0, text: String(res.responseText || '') }),
+          onerror: (err) => reject(new Error(str(err?.error || err?.statusText) || '网络请求失败')),
+          ontimeout: () => reject(new Error('请求超时')),
+          onabort: () => reject(new Error('请求已取消')),
+        });
+      });
+    }
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : 0;
+    try {
+      const res = await fetch(target, { ...options, signal: controller?.signal });
+      return { ok: res.ok, status: res.status, text: await res.text() };
+    } catch (e) {
+      const message = str(e?.message || e);
+      if (isCrossOriginUrl(target) && (!gmRequester()) && /failed to fetch|networkerror|load failed/i.test(message)) {
+        throw new Error('浏览器拦截了跨域 AI 请求，请改用 Tampermonkey 脚本版，或把 AI 接口换成同源代理');
+      }
+      throw e;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+  async function fetchJsonWithTimeout(url, options = {}, timeoutMs = WANDER_AI_REQUEST_TIMEOUT_MS) {
+    const res = await requestTextWithOptionalGm(url, options, timeoutMs);
+    const raw = res.text;
+    let data = null;
+    try { data = raw ? JSON.parse(raw) : null; } catch {}
+    if (!res.ok) {
+      const message = str(data?.error?.message || data?.message || raw).slice(0, 240) || `HTTP ${res.status}`;
+      const err = new Error(message);
+      err.status = res.status;
+      throw err;
+    }
+    return data;
+  }
+  function pageToken() { return str(STORAGE.getItem('token')); }
   function isPageSocketAccount(token) { return !!str(token) && str(token) === pageToken(); }
   function esc(v) {
     return String(v ?? '')
@@ -575,7 +824,7 @@
   }
   function settingsSummaryText() {
     const autoRefreshText = S.autoRefreshMinutes > 0 ? `每 ${S.autoRefreshMinutes} 分钟` : '已关闭';
-    return `版本 v${SCRIPT_VERSION} · 自动刷新 ${autoRefreshText} · 验证码 ${providerName()} · API ${S.apiBase}`;
+    return `版本 v${SCRIPT_VERSION} · 自动刷新 ${autoRefreshText} · 验证码 ${providerName()} · AI ${aiStatusText()} · API ${S.apiBase}`;
   }
   function summarizeWanderAccounts() {
     const summary = { ready: 0, pending: 0, generating: 0, cooling: 0, failed: 0, unavailable: 0 };
@@ -702,12 +951,14 @@
     if (!row || typeof row !== 'object') return null;
     if (episodeId && str(row.episodeId) !== str(episodeId)) return null;
     const optionIndex = Number.isFinite(Number(row.optionIndex)) ? Math.max(0, Math.floor(Number(row.optionIndex))) : null;
-    return optionIndex === null ? null : { episodeId: str(row.episodeId), optionIndex };
+    return optionIndex === null ? null : { episodeId: str(row.episodeId), optionIndex, source: str(row.source), reason: str(row.reason) };
   }
-  function setWanderDraft(id, episodeId, optionIndex) {
+  function setWanderDraft(id, episodeId, optionIndex, meta = null) {
     UI.wanderChoiceDraftById[id] = {
       episodeId: str(episodeId),
       optionIndex: Math.max(0, Math.floor(Number(optionIndex) || 0)),
+      source: str(meta?.source),
+      reason: str(meta?.reason),
     };
   }
   function clearWanderDraft(id, episodeId = '') {
@@ -773,6 +1024,152 @@
   }
   function wanderCurrentEpisode(overview) {
     return overview?.currentEpisode || null;
+  }
+  function syncWanderAutoEpisodeState(a, overview) {
+    const currentEpisode = wanderCurrentEpisode(overview);
+    if (!overview?.hasPendingEpisode || !currentEpisode?.id) {
+      a.wanderAutoPendingEpisodeId = '';
+      a.wanderAutoError = '';
+      return;
+    }
+    if (str(a.wanderAutoPendingEpisodeId) && str(a.wanderAutoPendingEpisodeId) !== str(currentEpisode.id)) {
+      a.wanderAutoError = '';
+    }
+  }
+  function wanderAutoStatusText(a) {
+    if (!a?.wanderAutoEnabled) return '未开启';
+    if (UI.wanderAutoBusyById[a.id]) return 'AI 决策中...';
+    if (!AI.ready) return AI.loading ? 'AI 配置校验中...' : (AI.error || '请先填写 AI 配置');
+    if (a.wanderAutoError) return `最近失败：${a.wanderAutoError}`;
+    if (a.wanderAutoLastChoice) return `最近选择：${a.wanderAutoLastChoice}`;
+    return `已开启 · ${AI.model}`;
+  }
+  function wanderAutoStatusExtra(a) {
+    const lines = [a.wanderAutoEnabled ? '自动云游：已开启' : '自动云游：未开启'];
+    if (a.wanderAutoLastAt) lines.push(`最近执行：${fmtTime(a.wanderAutoLastAt)}`);
+    if (a.wanderAutoLastChoice) lines.push(`AI 选择：${a.wanderAutoLastChoice}`);
+    if (a.wanderAutoError) lines.push(`最近失败：${a.wanderAutoError}`);
+    return lines.join('<br>');
+  }
+  function buildWanderAiPrompt(a, overview, episode) {
+    const story = wanderHistoryStory(overview);
+    const historyEpisodes = Array.isArray(story?.episodes)
+      ? story.episodes.filter((item) => str(item?.id) && str(item.id) !== str(episode?.id)).slice(-WANDER_AI_MAX_HISTORY_EPISODES)
+      : [];
+    const lines = [
+      '你是《九州》游戏的云游抉择助手。',
+      '请只根据提供的剧情与三个选项，挑选最稳妥、收益尽量高的选项。',
+      '优先级：1. 保命与稳定推进；2. 获取正向收益；3. 避免明显高风险、自损或失控。',
+      '必须只返回一行 JSON，不要使用 Markdown，不要输出额外解释。',
+      '返回格式固定为：{"choice":1,"reason":"不超过20字"}',
+      'choice 只能是 1、2、3。',
+      '',
+      `账号：${a.alias || a.username || a.character?.nickname || a.id}`,
+      `角色：${a.character?.title ? `${a.character.title} · ` : ''}${a.character?.nickname || '未知'}`,
+      story?.theme ? `故事主题：${story.theme}` : '',
+      story?.premise ? `故事背景：${story.premise}` : '',
+    ].filter(Boolean);
+    if (historyEpisodes.length) {
+      lines.push('最近已发生的剧情：');
+      historyEpisodes.forEach((item) => {
+        const title = `第 ${Math.max(1, item?.dayIndex || 1)} 幕 · ${item?.title || '未命名'}`;
+        const chosen = item?.chosenOptionText ? `；已选：${item.chosenOptionText}` : '';
+        const summary = item?.summary ? `；结果：${item.summary}` : '';
+        lines.push(`- ${title}${chosen}${summary}`);
+      });
+    }
+    lines.push(
+      `当前幕：第 ${Math.max(1, episode?.dayIndex || 1)} 幕 · ${episode?.title || '未命名'}`,
+      episode?.opening ? `当前剧情：${episode.opening}` : '',
+      episode?.summary ? `补充信息：${episode.summary}` : '',
+      '可选抉择：',
+      ...(Array.isArray(episode?.options) ? episode.options.map((option, index) => `${index + 1}. ${option?.text || '未返回'}`) : []),
+    );
+    return lines.filter(Boolean).join('\n');
+  }
+  function flattenAiText(value) {
+    if (typeof value === 'string') return value.trim();
+    if (Array.isArray(value)) return value.map((part) => {
+      if (typeof part === 'string') return part;
+      if (typeof part?.text === 'string') return part.text;
+      if (typeof part?.content === 'string') return part.content;
+      return '';
+    }).filter(Boolean).join('\n').trim();
+    if (value && typeof value === 'object') return flattenAiText(value.text || value.content || '');
+    return '';
+  }
+  function extractAiResponseText(data) {
+    const fromChoices = flattenAiText(data?.choices?.[0]?.message?.content || data?.choices?.[0]?.delta?.content || '');
+    if (fromChoices) return fromChoices;
+    const fromOutputText = flattenAiText(data?.output_text || '');
+    if (fromOutputText) return fromOutputText;
+    const fromContent = flattenAiText(data?.content || data?.output || '');
+    if (fromContent) return fromContent;
+    return '';
+  }
+  function normalizeWanderAiChoice(rawText, optionCount = WANDER_OPTION_COUNT) {
+    const text = str(String(rawText || '').replace(/^```(?:json)?/i, '').replace(/```$/i, ''));
+    if (!text) throw new Error('AI 未返回有效内容');
+    const candidates = [text, text.replace(/\\"/g, '"').replace(/\\n/g, '\n')];
+    const chineseNumberMap = { 一: 1, 二: 2, 三: 3 };
+    for (const candidate of candidates) {
+      const jsonBlock = candidate.match(/\{[\s\S]*\}/);
+      if (jsonBlock) {
+        try {
+          const parsed = JSON.parse(jsonBlock[0]);
+          const reason = str(parsed.reason || parsed.comment || parsed.note || '');
+          const directChoice = Number(parsed.choice ?? parsed.option ?? parsed.answer);
+          if (Number.isFinite(directChoice) && directChoice >= 1 && directChoice <= optionCount) {
+            return { optionIndex: directChoice - 1, choiceNumber: directChoice, reason };
+          }
+          const zeroIndex = Number(parsed.optionIndex ?? parsed.option_index ?? parsed.index);
+          if (Number.isFinite(zeroIndex) && zeroIndex >= 0 && zeroIndex < optionCount) {
+            return { optionIndex: zeroIndex, choiceNumber: zeroIndex + 1, reason };
+          }
+        } catch {}
+      }
+      let match = candidate.match(/(?:choice|option|answer|抉择|选项|选择)[^123一二三]{0,12}([123])/i);
+      if (match) return { optionIndex: Number(match[1]) - 1, choiceNumber: Number(match[1]), reason: '' };
+      match = candidate.match(/第\s*([一二三123])\s*(?:项|个|条|个选项|个抉择)?/);
+      if (match) {
+        const token = match[1];
+        const choiceNumber = Number.isFinite(Number(token)) ? Number(token) : chineseNumberMap[token];
+        if (choiceNumber >= 1 && choiceNumber <= optionCount) return { optionIndex: choiceNumber - 1, choiceNumber, reason: '' };
+      }
+      if (/^[123]$/.test(candidate)) return { optionIndex: Number(candidate) - 1, choiceNumber: Number(candidate), reason: '' };
+      match = candidate.match(/^\s*([123])(?:\D|$)/);
+      if (match) return { optionIndex: Number(match[1]) - 1, choiceNumber: Number(match[1]), reason: '' };
+      match = candidate.match(/\{\\"choice\\"\s*:\s*([123])/i);
+      if (match) return { optionIndex: Number(match[1]) - 1, choiceNumber: Number(match[1]), reason: '' };
+    }
+    throw new Error(`AI 返回无法解析：${text.slice(0, 120)}`);
+  }
+  async function requestWanderAiChoice(a, overview, episode) {
+    const ai = await ensureAiConfig();
+    if (!ai.ready) throw new Error(ai.error || 'AI 配置未就绪');
+    const url = openAiChatUrl();
+    if (!url) throw new Error('AI OpenAI 地址未配置');
+    const payload = {
+      model: ai.model,
+      user: str(a.character?.id || a.id || 'wander'),
+      temperature: 0.2,
+      stream: false,
+      messages: [
+        { role: 'system', content: '你是《九州》云游自动抉择助手，必须只返回一行 JSON：{"choice":1,"reason":"简短理由"}。' },
+        { role: 'user', content: buildWanderAiPrompt(a, overview, episode) },
+      ],
+    };
+    const data = await fetchJsonWithTimeout(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${ai.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+    const rawText = extractAiResponseText(data);
+    const choice = normalizeWanderAiChoice(rawText, Array.isArray(episode?.options) ? episode.options.length : WANDER_OPTION_COUNT);
+    return { ...choice, rawText, model: ai.model };
   }
   function wanderText(a) {
     if (!a?.character) return a?.hasCharacter === false ? '未创建角色' : '未读取';
@@ -943,8 +1340,13 @@
         <div class="wander-fold-body ${open ? 'show' : ''}">
           ${overview ? `
             <div class="wander-overview-top">
+              <div class="wander-auto-row">
+                <div class="wander-auto-toggle">自动云游（AI） · ${a.wanderAutoEnabled ? '全局已开启' : '全局未开启'}</div>
+                <div class="wander-auto-meta">${esc(wanderAutoStatusText(a))}</div>
+              </div>
               <div class="wander-tag-row">${wanderTagsHtml(overview)}</div>
               <div class="wander-overview-note">今日日期：${esc(overview.today || '未返回')}</div>
+              <div class="wander-overview-note">${wanderAutoStatusExtra(a)}</div>
             </div>
             ${wanderCurrentEpisodeActionsHtml(a, overview)}
             ${wanderStoryEntriesHtml(a, overview)}
@@ -1204,13 +1606,13 @@
     clearTencentPayload(id);
   }
   async function ensureSocketIoLoaded() {
-    if (typeof window.io === 'function') return window.io;
+    if (typeof PAGE.io === 'function') return PAGE.io;
     if (!socketIoPromise) {
       socketIoPromise = new Promise((resolve, reject) => {
         const script = document.createElement('script');
         script.src = `${socketBase()}/socket.io/socket.io.js`;
         script.onload = () => {
-          if (typeof window.io === 'function') resolve(window.io);
+          if (typeof PAGE.io === 'function') resolve(PAGE.io);
           else reject(new Error('socket.io 客户端加载成功，但 io 未注入到页面'));
         };
         script.onerror = () => reject(new Error('socket.io 客户端加载失败'));
@@ -1899,7 +2301,7 @@
   }
 
   function ensureTencentSdkLoaded() {
-    if (typeof window.TencentCaptcha !== 'undefined') return Promise.resolve();
+    if (typeof PAGE.TencentCaptcha !== 'undefined') return Promise.resolve();
     if (!sdkPromise) {
       sdkPromise = new Promise((resolve, reject) => {
         const script = document.createElement('script');
@@ -1920,7 +2322,7 @@
       await ensureTencentSdkLoaded();
       return await new Promise((resolve, reject) => {
         try {
-          const captcha = new window.TencentCaptcha(
+          const captcha = new PAGE.TencentCaptcha(
             String(C.tencentAppId),
             (result) => {
               if (result && result.ret === 0 && result.ticket) {
@@ -2187,9 +2589,13 @@
   }
   async function startIdle(id, autoTriggered = false) {
     const a = acct(id);
-    if (!a) return;
-    if (!a.token) return setMsg(a, '', '请先登录账号'), render();
-    if (loadState(id).idleStart || loadState(id).idleStop) return;
+    if (!a) return { success: false, skipped: true, message: '账号不存在' };
+    if (!a.token) {
+      setMsg(a, '', '请先登录账号');
+      render();
+      return { success: false, skipped: true, message: '未登录' };
+    }
+    if (loadState(id).idleStart || loadState(id).idleStop) return { success: false, skipped: true, message: '账号正忙' };
     setBusy(id, 'idleStart', true);
     setMsg(a, autoTriggered ? '自动续挂启动中...' : '启动挂机中...', '');
     render();
@@ -2213,14 +2619,17 @@
       runtime(id).idleAutoRestartKey = '';
       setMsg(a, autoTriggered ? '自动续挂已重新开始' : '挂机已开始', '');
       await refresh(id, true);
+      return { success: true, message: autoTriggered ? '自动续挂已重新开始' : '挂机已开始' };
     } catch (e) {
       const message = (typeof e?.message === 'string' ? e.message : String(e || '')).trim() || '未知错误';
       setMsg(a, '', `${autoTriggered ? '自动续挂失败' : '挂机启动失败'}：${message}`);
       runtime(id).idleNextStartAt = Date.now() + 60000;
+      return { success: false, message };
+    } finally {
+      setBusy(id, 'idleStart', false);
+      save();
+      render();
     }
-    setBusy(id, 'idleStart', false);
-    save();
-    render();
   }
   async function stopIdle(id) {
     const a = acct(id);
@@ -2485,6 +2894,7 @@
     const overview = normalizeWanderOverview({ ...(await readWanderOverview(a.token) || {}), fetchedAtMs: Date.now() });
     a.wanderOverview = overview;
     a.wanderError = '';
+    syncWanderAutoEpisodeState(a, overview);
     if (!silent) {
       save();
       renderWhenSafe();
@@ -2573,12 +2983,17 @@
       const currentEpisode = wanderCurrentEpisode(overview);
       if (overview.hasPendingEpisode && currentEpisode) {
         UI.wanderOpenById[id] = true;
-        setMsg(a, fromGlobal ? '已生成新云游，请到下方详情里手动选择并确认' : '请到下方云游详情里选择并确认', '');
+        a.wanderOverview = overview;
+        a.wanderError = '';
+        syncWanderAutoEpisodeState(a, overview);
+        const autoEnabled = a.wanderAutoEnabled === true;
+        setMsg(a, autoEnabled ? '云游结果已生成，准备交给 AI 自动投择...' : (fromGlobal ? '已生成新云游，请到下方详情里手动选择并确认' : '请到下方云游详情里选择并确认'), '');
         save();
         render();
-        return { success: true, pendingChoice: true, message: '待手动确认' };
+        if (autoEnabled) setTimeout(() => { void maybeAutoHandleWander(id, overview, { source: '一键云游' }); }, 0);
+        return { success: true, pendingChoice: true, message: autoEnabled ? 'AI 自动选择中' : '待手动确认' };
       }
-      if (overview.isCoolingDown) {
+    if (overview.isCoolingDown) {
         setMsg(a, `云游冷却中：${dur(wanderRemain(overview))}`, '');
         a.wanderOverview = overview;
         a.wanderError = '';
@@ -2622,6 +3037,119 @@
       render();
     }
   }
+  async function submitWanderChoice(id, episodeId, optionIndex, { source = 'manual', reason = '', keepBusy = false } = {}) {
+    const a = acct(id);
+    if (!a) return { success: false, message: '账号不存在' };
+    if (!a.token) {
+      setMsg(a, '', '请先登录账号');
+      render();
+      return { success: false, message: '未登录' };
+    }
+    const state = loadState(id);
+    if (!keepBusy && (state.wanderAction || state.refresh || state.login)) return { success: false, skipped: true, message: '账号正忙' };
+    const overview = normalizeWanderOverview(a.wanderOverview);
+    const currentEpisode = wanderCurrentEpisode(overview);
+    if (!currentEpisode || str(currentEpisode.id) !== str(episodeId) || overview?.hasPendingEpisode !== true) {
+      return { success: false, message: '当前没有待确认的云游选项' };
+    }
+    const normalizedOptionIndex = Math.max(0, Math.floor(Number(optionIndex) || 0));
+    const matched = Array.isArray(currentEpisode.options)
+      ? currentEpisode.options.find((option, index) => {
+        const idx = Number.isFinite(Number(option?.index)) ? Math.max(0, Math.floor(Number(option.index))) : index;
+        return idx === normalizedOptionIndex;
+      })
+      : null;
+    if (!matched) return { success: false, message: '选项不存在' };
+    if (!keepBusy) setBusy(id, 'wanderAction', true);
+    if (source === 'ai') {
+      setMsg(a, `AI 已选抉择 ${normalizedOptionIndex + 1}，提交中...`, '');
+      a.wanderAutoLastAt = now();
+      a.wanderAutoPendingEpisodeId = str(currentEpisode.id);
+      a.wanderAutoError = '';
+      a.wanderAutoLastChoice = `抉择 ${normalizedOptionIndex + 1}${reason ? ` · ${reason}` : ''}`;
+    } else {
+      setMsg(a, `纭浜戞父鎶夋嫨 ${normalizedOptionIndex + 1} 涓?..`, '');
+    }
+    render();
+    try {
+      const chooseResult = await chooseWanderOption(a.token, currentEpisode.id, normalizedOptionIndex);
+      const latest = await refreshWanderState(id, { silent: true });
+      clearWanderDraft(id, episodeId);
+      const awardedTitle = chooseResult?.awardedTitle?.name || latest?.currentEpisode?.rewardTitleName || '';
+      const baseMessage = source === 'ai' ? `AI 自动确认抉择 ${normalizedOptionIndex + 1}` : `浜戞父宸茬‘璁ゆ妷鎷?${normalizedOptionIndex + 1}`;
+      setMsg(a, awardedTitle ? `${baseMessage}，获得称号《${awardedTitle}》` : baseMessage, '');
+      if (source === 'ai') a.wanderAutoError = '';
+      save();
+      render();
+      return { success: true, awardedTitle };
+    } catch (e) {
+      const message = (typeof e?.message === 'string' ? e.message : String(e || '')).trim() || '未知错误';
+      if (source === 'ai') a.wanderAutoError = message;
+      if (Number(e?.status) === 401) {
+        a.token = '';
+        a.user = null;
+        a.hasCharacter = null;
+        clearCharacterState(a);
+        clearWanderDraft(id);
+        setMsg(a, '', '登录状态已失效，请重新登录');
+        save();
+        render();
+        return { success: false, message: '登录状态已失效，请重新登录' };
+      }
+      setMsg(a, '', `${source === 'ai' ? 'AI 自动云游确认失败' : '确认云游失败'}：${message}`);
+      save();
+      render();
+      return { success: false, message };
+    } finally {
+      if (!keepBusy) setBusy(id, 'wanderAction', false);
+      save();
+      render();
+    }
+  }
+  async function maybeAutoHandleWander(id, overview = null, { source = '' } = {}) {
+    const a = acct(id);
+    if (!a?.token || !a?.wanderAutoEnabled) return { success: false, skipped: true, message: '自动云游未开启' };
+    const currentOverview = normalizeWanderOverview(overview || a.wanderOverview);
+    const episode = wanderCurrentEpisode(currentOverview);
+    if (!currentOverview?.hasPendingEpisode || !episode?.id) return { success: false, skipped: true, message: '暂无待选择' };
+    if (UI.wanderAutoBusyById[id]) return { success: false, skipped: true, message: '自动云游处理中' };
+    const state = loadState(id);
+    if (state.wanderAction || state.refresh || state.login) return { success: false, skipped: true, message: '账号正忙' };
+    const draft = getWanderDraft(id, episode.id);
+    if (draft && draft.source !== 'ai') return { success: false, skipped: true, message: '存在手动选择，跳过自动云游' };
+    const lastAtMs = a.wanderAutoLastAt ? new Date(a.wanderAutoLastAt).getTime() : 0;
+    if (str(a.wanderAutoPendingEpisodeId) === str(episode.id) && lastAtMs > 0 && (Date.now() - lastAtMs) < WANDER_AI_RETRY_COOLDOWN_MS) {
+      return { success: false, skipped: true, message: '等待自动云游重试冷却' };
+    }
+    UI.wanderAutoBusyById[id] = true;
+    UI.wanderOpenById[id] = true;
+    a.wanderAutoPendingEpisodeId = str(episode.id);
+    a.wanderAutoLastAt = now();
+    a.wanderAutoError = '';
+    setMsg(a, `AI 正在分析云游抉择${source ? `（${source}）` : ''}...`, '');
+    save();
+    renderWhenSafe();
+    try {
+      const decision = await requestWanderAiChoice(a, currentOverview, episode);
+      setWanderDraft(id, episode.id, decision.optionIndex, { source: 'ai', reason: decision.reason });
+      save();
+      renderWhenSafe();
+      const result = await submitWanderChoice(id, episode.id, decision.optionIndex, { source: 'ai', reason: decision.reason });
+      return { ...result, choiceNumber: decision.choiceNumber, reason: decision.reason };
+    } catch (e) {
+      const message = str(e?.message || e) || '未知错误';
+      a.wanderAutoError = message;
+      a.wanderAutoLastAt = now();
+      setMsg(a, '', `自动云游失败：${message}`);
+      save();
+      renderWhenSafe();
+      return { success: false, message };
+    } finally {
+      UI.wanderAutoBusyById[id] = false;
+      save();
+      renderWhenSafe();
+    }
+  }
   async function confirmWanderChoice(id, episodeId) {
     const a = acct(id);
     if (!a) return { success: false, message: '账号不存在' };
@@ -2651,41 +3179,7 @@
       render();
       return { success: false, message: '请先选择抉择' };
     }
-    setBusy(id, 'wanderAction', true);
-    setMsg(a, `确认云游抉择 ${effectiveDraft.optionIndex + 1} 中...`, '');
-    render();
-    try {
-      const chooseResult = await chooseWanderOption(a.token, currentEpisode.id, effectiveDraft.optionIndex);
-      const latest = await refreshWanderState(id, { silent: true });
-      clearWanderDraft(id, episodeId);
-      const awardedTitle = chooseResult?.awardedTitle?.name || latest?.currentEpisode?.rewardTitleName || '';
-      const baseMessage = `云游已确认抉择 ${effectiveDraft.optionIndex + 1}`;
-      setMsg(a, awardedTitle ? `${baseMessage}，获得称号「${awardedTitle}」` : baseMessage, '');
-      save();
-      render();
-      return { success: true, awardedTitle };
-    } catch (e) {
-      const message = (typeof e?.message === 'string' ? e.message : String(e || '')).trim() || '未知错误';
-      if (Number(e?.status) === 401) {
-        a.token = '';
-        a.user = null;
-        a.hasCharacter = null;
-        clearCharacterState(a);
-        clearWanderDraft(id);
-        setMsg(a, '', '登录状态已失效，请重新登录');
-        save();
-        render();
-        return { success: false, message: '登录状态已失效，请重新登录' };
-      }
-      setMsg(a, '', `确认云游失败：${message}`);
-      save();
-      render();
-      return { success: false, message };
-    } finally {
-      setBusy(id, 'wanderAction', false);
-      save();
-      render();
-    }
+    return await submitWanderChoice(id, currentEpisode.id, effectiveDraft.optionIndex, { source: effectiveDraft.source || 'manual', reason: effectiveDraft.reason || '' });
   }
   async function exchangeSectTechniqueFragments(id, { fromGlobal = false } = {}) {
     const a = acct(id);
@@ -2810,6 +3304,123 @@
       setGlobalNotice('', `全局宗门兑换失败：${e.message || e}`);
     } finally {
       UI.sectExchangeAllBusy = false;
+      render();
+    }
+  }
+  async function executeWanderAll() {
+    const ids = S.accounts.filter((a) => a.token).map((a) => a.id);
+    if (!ids.length) {
+      setGlobalNotice('', '没有可执行云游的已登录账号');
+      render();
+      return;
+    }
+    if (UI.wanderAllBusy) return;
+    UI.wanderAllBusy = true;
+    setGlobalNotice(`一键云游中：${ids.length} 个账号`, '');
+    render();
+    let success = 0;
+    let failed = 0;
+    let skipped = 0;
+    let pending = 0;
+    let cooling = 0;
+    try {
+      for (const id of ids) {
+        const result = await executeWander(id, { fromGlobal: true });
+        if (result?.pendingChoice) pending += 1;
+        if (result?.cooling) cooling += 1;
+        if (result?.success && !result?.skipped) success += 1;
+        else if (result?.success && result?.skipped) skipped += 1;
+        else failed += 1;
+      }
+      setGlobalNotice(`一键云游完成：成功 ${success}，待确认 ${pending}，冷却 ${cooling}，跳过 ${skipped}，失败 ${failed}`, '');
+    } finally {
+      UI.wanderAllBusy = false;
+      render();
+    }
+  }
+  async function autoWanderAll() {
+    const ids = S.accounts.filter((a) => a.token).map((a) => a.id);
+    if (!ids.length) {
+      setGlobalNotice('', '没有可执行自动云游的已登录账号');
+      render();
+      return;
+    }
+    if (!AI.ready) {
+      setGlobalNotice('', AI.loading ? 'AI 配置校验中，请稍后再试' : '请先配置并校验 AI');
+      render();
+      return;
+    }
+    if (UI.wanderAutoAllBusy) return;
+    UI.wanderAutoAllBusy = true;
+    setGlobalNotice(`一键自动云游中：${ids.length} 个账号`, '');
+    render();
+    let success = 0;
+    let failed = 0;
+    let skipped = 0;
+    let pending = 0;
+    let cooling = 0;
+    try {
+      for (const id of ids) {
+        const a = acct(id);
+        if (!a) {
+          skipped += 1;
+          continue;
+        }
+        a.wanderAutoEnabled = true;
+        a.wanderAutoError = '';
+        const result = await executeWander(id, { fromGlobal: true });
+        if (result?.pendingChoice) pending += 1;
+        if (result?.cooling) cooling += 1;
+        if (result?.success && !result?.skipped) success += 1;
+        else if (result?.success && result?.skipped) skipped += 1;
+        else failed += 1;
+      }
+      save();
+      setGlobalNotice(`一键自动云游完成：成功 ${success}，待确认/自动处理 ${pending}，冷却 ${cooling}，跳过 ${skipped}，失败 ${failed}`, '');
+    } finally {
+      UI.wanderAutoAllBusy = false;
+      render();
+    }
+  }
+  async function startIdleAll() {
+    const ids = S.accounts.filter((a) => a.token).map((a) => a.id);
+    if (!ids.length) {
+      setGlobalNotice('', '没有可执行自动挂机的已登录账号');
+      render();
+      return;
+    }
+    if (UI.idleAllBusy) return;
+    UI.idleAllBusy = true;
+    setGlobalNotice(`一键自动挂机中：${ids.length} 个账号`, '');
+    render();
+    let success = 0;
+    let failed = 0;
+    let skipped = 0;
+    let unconfigured = 0;
+    try {
+      for (const id of ids) {
+        const a = acct(id);
+        if (!a) {
+          skipped += 1;
+          continue;
+        }
+        if (!idleConfigReady(a.idleConfig)) {
+          unconfigured += 1;
+          continue;
+        }
+        const st = a.idle;
+        if (st?.status === 'active' || st?.status === 'stopping') {
+          skipped += 1;
+          continue;
+        }
+        const result = await startIdle(id);
+        if (result?.success) success += 1;
+        else if (result?.skipped) skipped += 1;
+        else failed += 1;
+      }
+      setGlobalNotice(`一键自动挂机完成：成功 ${success}，未配置 ${unconfigured}，跳过 ${skipped}，失败 ${failed}`, '');
+    } finally {
+      UI.idleAllBusy = false;
       render();
     }
   }
@@ -3248,6 +3859,7 @@
         if (wr.status === 'fulfilled') {
           a.wanderOverview = normalizeWanderOverview({ ...(wr.value || {}), fetchedAtMs: Date.now() });
           a.wanderError = '';
+          syncWanderAutoEpisodeState(a, a.wanderOverview);
         } else {
           a.wanderOverview = null;
           a.wanderError = Number(wr.reason?.status) === 404 ? '接口未部署' : (str(wr.reason?.message || wr.reason) || '读取失败');
@@ -3278,6 +3890,10 @@
     save();
     if (silent) renderWhenSafe();
     else render();
+    const latestOverview = normalizeWanderOverview(a?.wanderOverview);
+    if (a?.wanderAutoEnabled && latestOverview?.hasPendingEpisode && wanderCurrentEpisode(latestOverview)) {
+      setTimeout(() => { void maybeAutoHandleWander(id, latestOverview, { source: silent ? '自动刷新' : '刷新状态' }); }, 0);
+    }
   }
   async function refreshAll(isAutomatic = false) {
     const ids = S.accounts.filter((a) => a.token).map((a) => a.id);
@@ -3306,6 +3922,7 @@
     const item = createAccount(nextOrder());
     S.accounts.push(item);
     UI.selectedId = item.id;
+    UI.accountSettingsOpenById[item.id] = true;
     save();
     render();
     if (C.provider === 'local') void refreshCaptcha(item.id);
@@ -3317,6 +3934,7 @@
     L.delete(id);
     R.delete(id);
     delete UI.wanderOpenById[id];
+    delete UI.accountSettingsOpenById[id];
     if (UI.selectedId === id) UI.selectedId = S.accounts[0]?.id || '';
     save();
     render();
@@ -3379,6 +3997,18 @@
     } else if (field === 'wanderOptionIndex') {
       a.wanderOptionIndex = normalizeWanderOptionIndex(val);
       save();
+    } else if (field === 'wanderAutoEnabled') {
+      a.wanderAutoEnabled = checked === true;
+      if (!a.wanderAutoEnabled) {
+        a.wanderAutoError = '';
+        a.wanderAutoPendingEpisodeId = '';
+      }
+      save();
+      render();
+      const overview = normalizeWanderOverview(a.wanderOverview);
+      if (a.wanderAutoEnabled && overview?.hasPendingEpisode && wanderCurrentEpisode(overview)) {
+        setTimeout(() => { void maybeAutoHandleWander(id, overview, { source: '开启自动云游' }); }, 0);
+      }
     }
   }
   function styles() {
@@ -3386,52 +4016,115 @@
       :host,*{box-sizing:border-box}
       .wrap{${IS_PAGE ? 'position:relative;height:100%;min-height:0;padding:16px;pointer-events:auto;z-index:1;' : 'position:fixed;inset:0;pointer-events:none;z-index:2147483647;'}font-family:"Microsoft YaHei",sans-serif;color:#e5edf5}
       .fab{display:${IS_PAGE ? 'none' : 'block'};pointer-events:auto;position:fixed;${PANEL_SIDE === 'left' ? 'left:18px;' : 'right:18px;'}bottom:18px;border:0;border-radius:999px;padding:12px 16px;background:#2563eb;color:#fff;font-weight:700;cursor:pointer;box-shadow:0 10px 28px rgba(37,99,235,.35)}
-      .panel{pointer-events:auto;${IS_PAGE ? 'position:relative;top:auto;left:auto;right:auto;bottom:auto;width:100%;min-height:100%;' : `position:fixed;top:12px;${PANEL_SIDE === 'left' ? 'left:12px;' : 'right:12px;'}bottom:12px;width:min(${PANEL_WIDTH}px,calc(100vw - 24px));transform:${PANEL_SIDE === 'left' ? 'translateX(calc(-100% - 18px))' : 'translateX(calc(100% + 18px))'};`}background:rgba(9,14,24,.97);border:1px solid rgba(148,163,184,.2);border-radius:16px;overflow:hidden;display:flex;flex-direction:column;transition:transform .2s ease}
-      .panel.open{transform:translateX(0)} .hd{padding:14px 16px;border-bottom:1px solid rgba(148,163,184,.15)} .hd1{display:flex;justify-content:space-between;align-items:center;gap:10px}
+      .panel{pointer-events:auto;${IS_PAGE ? 'position:relative;top:auto;left:auto;right:auto;bottom:auto;width:100%;min-height:100%;' : `position:fixed;top:12px;${PANEL_SIDE === 'left' ? 'left:12px;' : 'right:12px;'}bottom:12px;width:min(${PANEL_WIDTH}px,calc(100vw - 24px));transform:${PANEL_SIDE === 'left' ? 'translateX(calc(-100% - 18px))' : 'translateX(calc(100% + 18px))'};`}background:rgba(9,14,24,.985);border:1px solid rgba(148,163,184,.2);border-radius:18px;overflow:hidden;display:flex;flex-direction:column;transition:transform .2s ease;box-shadow:0 22px 60px rgba(2,6,23,.45)}
+      .panel.open{transform:translateX(0)}
+      .hd{padding:16px 18px 12px;border-bottom:1px solid rgba(148,163,184,.15);background:linear-gradient(180deg,rgba(15,23,42,.94),rgba(9,14,24,.96))}
+      .hd1{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
       .head-left,.head-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-      .title{margin:0;font-size:${IS_PAGE ? '24px' : '18px'};font-weight:800} .sub{margin:8px 0 0;font-size:12px;line-height:1.5;color:#94a3b8}
-      .version-badge{display:inline-flex;align-items:center;justify-content:center;padding:3px 8px;border-radius:999px;background:rgba(37,99,235,.18);color:#93c5fd;font-size:11px;font-weight:800}
-      .settings-summary{margin-top:8px;font-size:12px;line-height:1.6;color:#94a3b8}
-      .x,.toggle{display:inline-flex;align-items:center;justify-content:center;border:0;background:rgba(148,163,184,.14);color:#e2e8f0;border-radius:10px;padding:8px 10px;cursor:pointer;font-weight:700}
+      .title{margin:0;font-size:${IS_PAGE ? '26px' : '22px'};font-weight:800}
+      .sub{margin:8px 0 0;font-size:12px;line-height:1.6;color:#94a3b8}
+      .version-badge{display:inline-flex;align-items:center;justify-content:center;padding:4px 10px;border-radius:999px;background:rgba(37,99,235,.18);color:#93c5fd;font-size:11px;font-weight:800}
+      .settings-summary{margin-top:10px;font-size:12px;line-height:1.7;color:#94a3b8}
+      .x,.toggle{display:inline-flex;align-items:center;justify-content:center;border:0;background:rgba(148,163,184,.14);color:#e2e8f0;border-radius:10px;padding:8px 12px;cursor:pointer;font-weight:700}
       .x{display:${IS_PAGE ? 'none' : 'inline-flex'}}
-      .settings-box{display:none}
+      .settings-box{display:none;margin-top:12px;padding-top:12px;border-top:1px solid rgba(148,163,184,.12)}
       .settings-box.show{display:block}
-      .cfg,.grid,.stats,.summary-grid,.feature-grid{display:grid;gap:10px} .cfg{grid-template-columns:${IS_PAGE ? 'repeat(4,minmax(0,1fr))' : '1fr 1fr'};margin-top:12px} .cfg .wide{grid-column:1 / -1} .grid,.stats{grid-template-columns:1fr 1fr} .feature-grid{grid-template-columns:${IS_PAGE ? 'repeat(3,minmax(0,1fr))' : '1fr'};margin-top:12px} .summary-grid{grid-template-columns:${IS_PAGE ? 'repeat(auto-fit,minmax(220px,1fr))' : '1fr'};margin:12px 0 0}
-      .body{flex:1;overflow:auto;padding:${IS_PAGE ? '16px' : '12px'};background:rgba(2,6,23,.65)} .list{display:${IS_PAGE ? 'grid' : 'flex'};${IS_PAGE ? 'grid-template-columns:repeat(auto-fit,minmax(420px,1fr));align-items:start;' : 'flex-direction:column;'}gap:${IS_PAGE ? '16px' : '12px'}}
-      .page-layout{display:grid;grid-template-columns:minmax(260px,320px) minmax(0,1fr);gap:16px;align-items:start}
-      .side{position:sticky;top:0;display:flex;flex-direction:column;gap:12px;padding:12px;border:1px solid rgba(148,163,184,.16);border-radius:14px;background:rgba(15,23,42,.82)}
+      .summary-strip{margin-top:12px}
+      .cfg,.grid,.stats,.summary-grid,.feature-grid{display:grid;gap:12px}
+      .cfg{grid-template-columns:repeat(4,minmax(0,1fr));margin-top:12px}
+      .cfg .wide{grid-column:1 / -1}
+      .grid,.stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+      .feature-grid{grid-template-columns:repeat(2,minmax(0,1fr));margin-top:12px}
+      .summary-grid{grid-template-columns:repeat(5,minmax(0,1fr));margin:0}
+      .body{flex:1;overflow:auto;padding:${IS_PAGE ? '14px' : '12px'};background:rgba(2,6,23,.68)}
+      .workspace-layout{display:grid;grid-template-columns:minmax(250px,290px) minmax(0,1fr);gap:14px;align-items:start}
+      .workspace-main,.detail{min-width:0}
+      .list{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));align-items:start;gap:16px}
+      .side{position:sticky;top:0;display:flex;flex-direction:column;gap:12px;padding:12px;border:1px solid rgba(148,163,184,.16);border-radius:16px;background:rgba(15,23,42,.84);box-shadow:0 12px 34px rgba(2,6,23,.2)}
       .side-title{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:14px;font-weight:800}
       .side-count{font-size:12px;color:#94a3b8}
-      .side-list{display:flex;flex-direction:column;gap:10px}
-      .side-item{width:100%;border:1px solid rgba(148,163,184,.14);border-radius:12px;background:rgba(2,6,23,.45);color:#e5edf5;padding:12px;cursor:pointer;text-align:left}
-      .side-item.active{border-color:rgba(59,130,246,.7);background:rgba(37,99,235,.16);box-shadow:0 0 0 1px rgba(59,130,246,.18) inset}
+      .side-list{display:flex;flex-direction:column;gap:10px;overflow:auto;max-height:${IS_PAGE ? 'calc(100vh - 280px)' : 'calc(100vh - 320px)'};padding-right:2px}
+      .side-empty{padding:18px 14px;border:1px dashed rgba(148,163,184,.24);border-radius:14px;font-size:12px;line-height:1.7;color:#94a3b8;text-align:center}
+      .side-footer{display:flex;gap:10px;flex-wrap:wrap}
+      .side-item{width:100%;border:1px solid rgba(148,163,184,.14);border-radius:14px;background:rgba(2,6,23,.5);color:#e5edf5;padding:12px;cursor:pointer;text-align:left;transition:background .15s ease,border-color .15s ease,transform .15s ease}
+      .side-item:hover{background:rgba(15,23,42,.78)}
+      .side-item.active{border-color:rgba(59,130,246,.72);background:rgba(37,99,235,.16);box-shadow:0 0 0 1px rgba(59,130,246,.18) inset;transform:translateY(-1px)}
       .side-item-top{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
       .side-item-name{font-size:14px;font-weight:800;line-height:1.4}
-      .side-item-meta{margin-top:6px;font-size:12px;color:#94a3b8;line-height:1.6}
-      .detail{min-width:0}
-      .card{border:1px solid rgba(148,163,184,.16);border-radius:14px;padding:12px;background:rgba(15,23,42,.82)} .ch{display:flex;justify-content:space-between;gap:10px}
-      .name{margin:0;font-size:16px;font-weight:800} .meta{margin-top:4px;font-size:12px;color:#94a3b8;line-height:1.5}
+      .side-item-sub{margin-top:4px;font-size:12px;color:#94a3b8}
+      .side-item-meta{margin-top:10px;display:flex;flex-direction:column;gap:10px}
+      .side-status-grid{display:flex;flex-wrap:wrap;gap:8px}
+      .side-status-pill{display:inline-flex;align-items:center;gap:6px;min-height:26px;padding:0 10px;border-radius:999px;background:rgba(15,23,42,.9);border:1px solid rgba(148,163,184,.12);font-size:11px;line-height:1.4;color:#dbe7fb}
+      .side-status-pill-label{color:#93a6c5}
+      .side-item-foot{font-size:11px;color:#94a3b8;line-height:1.6}
+      .card{border:1px solid rgba(148,163,184,.16);border-radius:16px;padding:12px;background:rgba(15,23,42,.82);box-shadow:0 10px 28px rgba(2,6,23,.16)}
+      .ch{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+      .name{margin:0;font-size:18px;font-weight:800}
+      .meta{margin-top:4px;font-size:12px;color:#94a3b8;line-height:1.6}
       .badge{display:inline-flex;align-items:center;justify-content:center;padding:4px 10px;border-radius:999px;font-size:11px;font-weight:800;white-space:nowrap;background:rgba(148,163,184,.18);color:#cbd5e1}
       .badge.on{background:rgba(22,163,74,.18);color:#86efac}
-      label{display:flex;flex-direction:column;gap:6px;font-size:12px;color:#cbd5e1} input:not([type="checkbox"]):not([type="radio"]),select,textarea{width:100%;border:1px solid rgba(148,163,184,.22);border-radius:10px;background:rgba(15,23,42,.88);color:#f8fafc;padding:10px 12px;outline:none} textarea{min-height:100px;resize:vertical}
+      .account-status-bar{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+      .account-status-pill{display:inline-flex;align-items:center;gap:8px;min-height:30px;padding:0 11px;border-radius:999px;background:rgba(2,6,23,.56);border:1px solid rgba(148,163,184,.12);font-size:12px;font-weight:700;line-height:1.5;color:#e5edf5}
+      .account-status-pill-label{color:#9aaccc}
+      .compact-stats-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:10px}
+      .compact-stat{border:1px solid rgba(148,163,184,.14);border-radius:14px;padding:10px 11px;background:rgba(2,6,23,.5)}
+      .compact-stat-label{font-size:11px;color:#94a3b8}
+      .compact-stat-value{margin-top:6px;font-size:15px;font-weight:800;line-height:1.45;word-break:break-word}
+      .compact-stat-extra{margin-top:6px;font-size:11px;line-height:1.55;color:#94a3b8}
+      .account-settings-box{margin-top:10px;border:1px solid rgba(148,163,184,.14);border-radius:14px;background:rgba(2,6,23,.42);overflow:hidden}
+      .account-settings-toggle{width:100%;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border:0;background:transparent;color:#e5edf5;cursor:pointer;text-align:left}
+      .account-settings-toggle:hover{background:rgba(15,23,42,.5)}
+      .account-settings-toggle-main{min-width:0}
+      .account-settings-toggle-title{font-size:13px;font-weight:800}
+      .account-settings-toggle-sub{margin-top:4px;font-size:12px;line-height:1.5;color:#94a3b8}
+      .account-settings-toggle-side{flex:0 0 auto;font-size:12px;font-weight:700;color:#93c5fd}
+      .account-settings-body{display:none;padding:0 12px 12px}
+      .account-settings-body.show{display:block}
+      label{display:flex;flex-direction:column;gap:6px;font-size:12px;color:#cbd5e1}
+      input:not([type="checkbox"]):not([type="radio"]),select,textarea{width:100%;border:1px solid rgba(148,163,184,.22);border-radius:10px;background:rgba(15,23,42,.88);color:#f8fafc;padding:10px 12px;outline:none}
+      textarea{min-height:100px;resize:vertical}
       input[disabled]{opacity:.72;cursor:not-allowed}
-      .inline{display:flex;align-items:center;gap:8px;border:1px solid rgba(148,163,184,.22);border-radius:10px;padding:10px 12px;background:rgba(15,23,42,.88)} .inline input{width:auto;margin:0;padding:0} .perm,.import-note{font-size:12px;color:#94a3b8}
-      .cap{display:grid;grid-template-columns:120px 1fr;gap:12px;margin-top:12px} .img{height:56px;border-radius:12px;border:1px solid rgba(148,163,184,.18);display:flex;align-items:center;justify-content:center;overflow:hidden;background:rgba(2,6,23,.75)} .img img{width:100%;height:100%;object-fit:contain;background:#fff}
-      .acts{display:flex;flex-wrap:wrap;gap:8px;align-content:flex-start} .btn{border:0;border-radius:10px;padding:9px 12px;background:#2563eb;color:#fff;font-size:12px;font-weight:700;cursor:pointer} .btn.alt{background:rgba(30,41,59,.95)} .btn.warn{background:#dc2626} .btn:disabled{opacity:.55;cursor:not-allowed}
-      .msg{margin-top:12px;padding:10px 12px;border-radius:12px;font-size:12px;line-height:1.5;background:rgba(30,64,175,.22);color:#bfdbfe} .msg.err{background:rgba(127,29,29,.26);color:#fecaca}
-      .st{border:1px solid rgba(148,163,184,.14);border-radius:12px;padding:10px 12px;background:rgba(2,6,23,.5)} .sl{font-size:11px;color:#94a3b8} .sv{margin-top:6px;font-size:14px;font-weight:800;line-height:1.45} .sx{margin-top:6px;font-size:11px;color:#94a3b8;line-height:1.5}
-      .summary-card{border:1px solid rgba(148,163,184,.14);border-radius:12px;padding:10px 12px;background:rgba(2,6,23,.45)} .summary-card .label{font-size:11px;color:#94a3b8} .summary-card .value{margin-top:6px;font-size:14px;font-weight:800;line-height:1.45} .summary-card .extra{margin-top:6px;font-size:11px;color:#94a3b8;line-height:1.5}
-      .toolbar{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px} .toolbar.daily{margin-top:10px} .empty,.foot{font-size:12px;color:#94a3b8} .empty{padding:26px 18px;text-align:center;border:1px dashed rgba(148,163,184,.25);border-radius:14px} .foot{margin-top:10px;line-height:1.6}
-      .wander-panel-box{margin-top:12px;border:1px solid rgba(148,163,184,.14);border-radius:14px;background:rgba(2,6,23,.42);overflow:hidden}
-      .wander-fold{width:100%;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;border:0;background:transparent;color:#e5edf5;cursor:pointer;text-align:left}
+      .inline{display:flex;align-items:center;gap:8px;border:1px solid rgba(148,163,184,.22);border-radius:10px;padding:10px 12px;background:rgba(15,23,42,.88)}
+      .inline input{width:auto;margin:0;padding:0}
+      .perm,.import-note{font-size:12px;color:#94a3b8}
+      .cap{display:grid;grid-template-columns:120px 1fr;gap:12px;margin-top:12px}
+      .img{height:56px;border-radius:12px;border:1px solid rgba(148,163,184,.18);display:flex;align-items:center;justify-content:center;overflow:hidden;background:rgba(2,6,23,.75)}
+      .img img{width:100%;height:100%;object-fit:contain;background:#fff}
+      .acts{display:flex;flex-wrap:wrap;gap:8px;align-content:flex-start}
+      .btn{border:0;border-radius:10px;padding:9px 12px;background:#2563eb;color:#fff;font-size:12px;font-weight:700;cursor:pointer}
+      .btn.alt{background:rgba(30,41,59,.95)}
+      .btn.warn{background:#dc2626}
+      .btn:disabled{opacity:.55;cursor:not-allowed}
+      .msg{margin-top:10px;padding:10px 12px;border-radius:12px;font-size:12px;line-height:1.6;background:rgba(30,64,175,.22);color:#bfdbfe}
+      .msg.err{background:rgba(127,29,29,.26);color:#fecaca}
+      .st{border:1px solid rgba(148,163,184,.14);border-radius:12px;padding:10px 12px;background:rgba(2,6,23,.5)}
+      .sl{font-size:11px;color:#94a3b8}
+      .sv{margin-top:6px;font-size:14px;font-weight:800;line-height:1.45}
+      .sx{margin-top:6px;font-size:11px;color:#94a3b8;line-height:1.55}
+      .summary-card{border:1px solid rgba(148,163,184,.14);border-radius:14px;padding:10px 12px;background:rgba(2,6,23,.48);min-height:84px}
+      .summary-card .label{font-size:11px;color:#94a3b8}
+      .summary-card .value{margin-top:6px;font-size:16px;font-weight:800;line-height:1.45}
+      .summary-card .extra{margin-top:6px;font-size:11px;color:#94a3b8;line-height:1.5}
+      .toolbar{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+      .toolbar.daily{margin-top:10px}
+      .global-toolbar{margin-top:14px}
+      .empty,.foot{font-size:12px;color:#94a3b8}
+      .empty{padding:32px 20px;text-align:center;border:1px dashed rgba(148,163,184,.25);border-radius:14px}
+      .foot{margin-top:10px;line-height:1.6}
+      .wander-panel-box{margin-top:10px;border:1px solid rgba(148,163,184,.14);border-radius:14px;background:rgba(2,6,23,.42);overflow:hidden}
+      .wander-fold{width:100%;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border:0;background:transparent;color:#e5edf5;cursor:pointer;text-align:left}
       .wander-fold:hover{background:rgba(15,23,42,.5)}
       .wander-fold-main{min-width:0}
       .wander-fold-title{font-size:13px;font-weight:800}
       .wander-fold-sub{margin-top:4px;font-size:12px;line-height:1.5;color:#94a3b8}
       .wander-fold-side{flex:0 0 auto;font-size:12px;font-weight:700;color:#93c5fd}
-      .wander-fold-body{display:none;padding:0 14px 14px}
+      .wander-fold-body{display:none;padding:0 12px 12px}
       .wander-fold-body.show{display:block}
       .wander-overview-top{display:flex;flex-direction:column;gap:8px;padding-top:2px}
+      .wander-auto-row{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+      .wander-auto-toggle{display:inline-flex;align-items:center;gap:8px;font-size:12px;font-weight:700;color:#e2e8f0}
+      .wander-auto-toggle input{margin:0}
+      .wander-auto-meta{font-size:12px;line-height:1.5;color:#93c5fd}
       .wander-tag-row{display:flex;flex-wrap:wrap;gap:8px}
       .wander-tag{display:inline-flex;align-items:center;justify-content:center;padding:3px 8px;border-radius:999px;background:rgba(148,163,184,.14);font-size:11px;font-weight:700;color:#cbd5e1}
       .wander-tag.is-info{background:rgba(37,99,235,.18);color:#bfdbfe}
@@ -3461,10 +4154,30 @@
       .wander-confirm-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:10px;padding:10px 12px;border-radius:12px;background:rgba(15,23,42,.82)}
       .wander-confirm-text{font-size:12px;line-height:1.6;color:#cbd5e1}
       .wander-confirm-hint{font-size:12px;line-height:1.6;color:#94a3b8}
-      .import-box{display:none;margin-top:12px;padding:12px;border:1px solid rgba(148,163,184,.16);border-radius:12px;background:rgba(2,6,23,.42)} .import-box.show{display:block}
-      @media (max-width:1100px){.cfg{grid-template-columns:1fr 1fr}.feature-grid{grid-template-columns:1fr 1fr}.list{grid-template-columns:repeat(auto-fit,minmax(360px,1fr))}.page-layout{grid-template-columns:260px minmax(0,1fr)}}
-      @media (max-width:760px){.page-layout,.cfg,.grid,.stats,.cap,.list,.summary-grid,.feature-grid{grid-template-columns:1fr}.side{position:relative}.wander-story-head,.wander-entry-head,.wander-fold,.wander-confirm-bar{flex-direction:column;align-items:flex-start}.wander-fold-side{padding-left:0}}
-      @media (max-width:640px){.cfg,.grid,.stats,.cap,.list,.summary-grid,.feature-grid{grid-template-columns:1fr}.wrap{${IS_PAGE ? 'padding:8px;' : ''}}.panel{${IS_PAGE ? 'min-height:100%;' : `top:8px;${PANEL_SIDE === 'left' ? 'left:8px;' : 'right:8px;'}bottom:8px;width:calc(100vw - 16px);`}}.img{width:100%}}
+      .import-box{display:none;margin-top:12px;padding:12px;border:1px solid rgba(148,163,184,.16);border-radius:12px;background:rgba(2,6,23,.42)}
+      .import-box.show{display:block}
+      @media (max-width:1400px){
+        .cfg{grid-template-columns:repeat(2,minmax(0,1fr))}
+        .summary-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+        .compact-stats-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+      }
+      @media (max-width:1120px){
+        .workspace-layout{grid-template-columns:1fr}
+        .side{position:relative}
+        .side-list{max-height:none}
+        .summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+        .grid,.stats,.feature-grid,.compact-stats-grid{grid-template-columns:1fr}
+      }
+      @media (max-width:760px){
+        .workspace-layout,.cfg,.grid,.stats,.summary-grid,.feature-grid,.cap,.list,.compact-stats-grid{grid-template-columns:1fr}
+        .hd1,.ch,.cap,.wander-story-head,.wander-entry-head,.wander-fold,.wander-confirm-bar{flex-direction:column;align-items:flex-start}
+        .wander-fold-side{padding-left:0}
+      }
+      @media (max-width:640px){
+        .wrap{${IS_PAGE ? 'padding:8px;' : ''}}
+        .panel{${IS_PAGE ? 'min-height:100%;' : `top:8px;${PANEL_SIDE === 'left' ? 'left:8px;' : 'right:8px;'}bottom:8px;width:calc(100vw - 16px);`}}
+        .img{width:100%}
+      }
     `;
   }
 
@@ -3473,6 +4186,52 @@
   }
   function summaryCard(label, value, extra = '') {
     return `<div class="summary-card"><div class="label">${esc(label)}</div><div class="value">${value}</div><div class="extra">${extra || '—'}</div></div>`;
+  }
+  function sideStatusPill(label, value, type, id) {
+    const valueHtml = type ? `<span data-side-type="${esc(type)}" data-id="${esc(id)}">${esc(value)}</span>` : esc(value);
+    return `<span class="side-status-pill"><span class="side-status-pill-label">${esc(label)}</span>${valueHtml}</span>`;
+  }
+  function globalToolbarHtml(anyGlobalBatchBusy) {
+    const hasToken = S.accounts.some((a) => a.token);
+    const autoWanderDisabled = anyGlobalBatchBusy || !hasToken || AI.loading || !AI.ready;
+    return `
+      <div class="toolbar global-toolbar">
+        <button class="btn alt" id="all" ${!S.accounts.length ? 'disabled' : ''}>一键刷新状态</button>
+        <button class="btn alt" id="signInAll" ${(anyGlobalBatchBusy || !hasToken) ? 'disabled' : ''}>${UI.signInAllBusy ? '一键签到中...' : '一键签到'}</button>
+        <button class="btn alt" id="monthCardClaimAll" ${(anyGlobalBatchBusy || !hasToken) ? 'disabled' : ''}>${UI.monthCardClaimAllBusy ? '一键领取中...' : '一键领取月卡'}</button>
+        <button class="btn alt" id="wanderAll" ${(anyGlobalBatchBusy || !hasToken) ? 'disabled' : ''}>${UI.wanderAllBusy ? '一键云游中...' : '一键云游'}</button>
+        <button class="btn alt" id="wanderAutoAll" ${autoWanderDisabled ? 'disabled' : ''}>${UI.wanderAutoAllBusy ? '自动云游中...' : '一键自动云游'}</button>
+        <button class="btn alt" id="idleAll" ${(anyGlobalBatchBusy || !hasToken) ? 'disabled' : ''}>${UI.idleAllBusy ? '自动挂机中...' : '一键自动挂机'}</button>
+        <button class="btn alt" id="sectExchangeAll" ${(anyGlobalBatchBusy || !hasToken) ? 'disabled' : ''}>${UI.sectExchangeAllBusy ? '一键兑换中...' : '一键兑换500残页'}</button>
+      </div>`;
+  }
+  function workspaceHtml(xs, current, currentIndex) {
+    return `
+      <div class="workspace-layout">
+        <aside class="side">
+          <div class="side-title">
+            <span>账号列表</span>
+            <span class="side-count">${esc(xs.length)} 个账号</span>
+          </div>
+          <div class="side-list" data-scroll-key="account-side-list">
+            ${xs.length ? xs.map(sideItem).join('') : '<div class="side-empty">还没有账号，先添加一个账号开始。</div>'}
+          </div>
+          <div class="side-footer">
+            <button class="btn" id="add">新增账号</button>
+            <button class="btn alt" id="toggleImport">${UI.importOpen ? '收起批量导入' : '批量导入'}</button>
+          </div>
+        </aside>
+        <section class="workspace-main">
+          ${current ? card(current, currentIndex) : '<div class="empty">请选择账号，或先在左侧新增账号。</div>'}
+        </section>
+      </div>`;
+  }
+  function accountStatusPill(label, value, type, id) {
+    const valueHtml = type ? `<span data-type="${esc(type)}" data-id="${esc(id)}">${esc(value)}</span>` : esc(value);
+    return `<span class="account-status-pill"><span class="account-status-pill-label">${esc(label)}</span>${valueHtml}</span>`;
+  }
+  function compactAccountStat(label, value, extra = '') {
+    return `<div class="compact-stat"><div class="compact-stat-label">${esc(label)}</div><div class="compact-stat-value">${esc(value)}</div><div class="compact-stat-extra">${extra || '—'}</div></div>`;
   }
 
   function captchaFieldHtml(a, t) {
@@ -3495,23 +4254,26 @@
   }
 
   function sideItem(a) {
+    const serverUser = a.user?.username || a.username || '未填写用户名';
     return `
       <button type="button" class="side-item ${UI.selectedId === a.id ? 'active' : ''}" data-select="${esc(a.id)}">
         <div class="side-item-top">
           <div class="side-item-name">${esc(a.alias || a.username || '未命名账号')}</div>
           <div class="badge ${a.token ? 'on' : ''}">${a.token ? '已登录' : '未登录'}</div>
         </div>
+        <div class="side-item-sub">${esc(serverUser)}</div>
         <div class="side-item-meta">
-          用户名：${esc(a.username || '—')}<br>
-          体力：<span data-side-type="stamina" data-id="${esc(a.id)}">${esc(staminaText(a))}</span><br>
-          资产：${esc(currencyText(a))}<br>
-          签到：${esc(signInText(a))}<br>
-          月卡：${esc(monthCardText(a))}<br>
-          云游：<span data-side-type="wander" data-id="${esc(a.id)}">${esc(wanderText(a))}</span><br>
-          挂机：<span data-side-type="idle" data-id="${esc(a.id)}">${esc(idleText(a.idle, a.idleError))}</span><br>
-          秘境：<span data-side-type="dungeon" data-id="${esc(a.id)}">${esc(dungeonShortText(a))}</span><br>
-          功法：${esc(cdText(a.technique))}<br>
-          招募：${esc(cdText(a.partner))}
+          <div class="side-status-grid">
+            ${sideStatusPill('体力', staminaText(a), 'stamina', a.id)}
+            ${sideStatusPill('签到', signInText(a))}
+            ${sideStatusPill('月卡', monthCardText(a))}
+            ${sideStatusPill('云游', wanderText(a), 'wander', a.id)}
+            ${sideStatusPill('挂机', idleText(a.idle, a.idleError), 'idle', a.id)}
+            ${sideStatusPill('秘境', dungeonShortText(a), 'dungeon', a.id)}
+            ${sideStatusPill('功法', cdText(a.technique), 'technique', a.id)}
+            ${sideStatusPill('招募', cdText(a.partner), 'partner', a.id)}
+          </div>
+          <div class="side-item-foot">资产：${esc(currencyText(a))}</div>
         </div>
       </button>`;
   }
@@ -3520,64 +4282,73 @@
     const b = loadState(a.id);
     const c = a.character;
     const dungeonRunning = runtime(a.id).dungeonRunning;
-    const anyBatchBusy = UI.signInAllBusy || UI.monthCardClaimAllBusy || UI.sectExchangeAllBusy;
     const realm = c ? [c.realm, c.subRealm].filter(Boolean).join(' · ') || '未读取' : (a.hasCharacter === false ? '未创建角色' : '未读取');
     const msg = a.lastError || a.lastMessage || '';
     const err = !!a.lastError;
+    const settingsOpen = UI.accountSettingsOpenById[a.id] === true;
+    const metaLine = [
+      a.user?.username ? `服务端用户：${a.user.username}` : '服务端用户：未登录',
+      `上次登录：${fmtTime(a.lastLoginAt)}`,
+      `上次刷新：${fmtTime(a.lastRefreshAt)}`,
+    ].join(' · ');
     return `
       <div class="card">
         <div class="ch">
           <div>
             <h3 class="name">${esc(a.alias || a.username || `账号 ${i + 1}`)}</h3>
-            <div class="meta">${esc(a.user?.username ? `服务端用户：${a.user.username}` : '服务端用户：未登录')}<br>上次登录：${esc(fmtTime(a.lastLoginAt))}<br>上次刷新：${esc(fmtTime(a.lastRefreshAt))}</div>
+            <div class="meta">${esc(metaLine)}</div>
           </div>
           <div class="badge ${a.token ? 'on' : ''}">${a.token ? '已登录' : '未登录'}</div>
         </div>
-        <div class="grid" style="margin-top:12px">
-          <label>备注<input data-field="alias" data-id="${esc(a.id)}" value="${esc(a.alias)}" placeholder="例如：大号 / 小号"></label>
-          <label>用户名<input data-field="username" data-id="${esc(a.id)}" value="${esc(a.username)}" placeholder="登录用户名"></label>
-          <label>密码（仅当前页面内存）<input type="password" data-field="password" data-id="${esc(a.id)}" value="${esc(t.password)}" placeholder="登录密码"></label>
-          ${captchaFieldHtml(a, t)}
-        </div>
-        <div class="cap">
-          ${captchaVisualHtml(a, t)}
-          <div class="acts">
-            <button class="btn alt" data-action="captcha" data-id="${esc(a.id)}" ${C.provider === 'local' && b.captcha ? 'disabled' : ''}>${esc(captchaButtonText(b))}</button>
-            <button class="btn" data-action="login" data-id="${esc(a.id)}" ${(b.login || C.sdkLoading) ? 'disabled' : ''}>${b.login ? '登录中...' : '登录'}</button>
-            <button class="btn alt" data-action="refresh" data-id="${esc(a.id)}" ${b.refresh || !a.token ? 'disabled' : ''}>${b.refresh ? '刷新中...' : '刷新状态'}</button>
-            <button class="btn alt" data-action="logout" data-id="${esc(a.id)}" ${!a.token ? 'disabled' : ''}>清空 Token</button>
-            <button class="btn warn" data-action="remove" data-id="${esc(a.id)}">删除</button>
-          </div>
-        </div>
-        <div class="feature-grid">
-          <label>自动秘境（ID）<input data-field="dungeonId" data-id="${esc(a.id)}" value="${esc(a.dungeonId)}" list="dungeonCatalog" placeholder="${esc(dungeonInputPlaceholder())}"></label>
-          <label>自动秘境难度<input data-field="dungeonRank" data-id="${esc(a.id)}" type="number" min="1" step="1" value="${esc(Math.max(1, Math.floor(Number(a.dungeonRank) || 1)))}"></label>
-        </div>
-        <div class="toolbar daily">
-          <button class="btn alt" data-action="signIn" data-id="${esc(a.id)}" ${(b.signIn || !a.token || anyBatchBusy) ? 'disabled' : ''}>${b.signIn ? '签到中...' : '一键签到'}</button>
-          <button class="btn alt" data-action="monthCardClaim" data-id="${esc(a.id)}" ${(b.monthCardClaim || !a.token || anyBatchBusy) ? 'disabled' : ''}>${b.monthCardClaim ? '领取中...' : '领取月卡奖励'}</button>
-          <button class="btn alt" data-action="wanderAction" data-id="${esc(a.id)}" ${(b.wanderAction || !a.token || anyBatchBusy) ? 'disabled' : ''}>${wanderActionLabel(a)}</button>
-          <button class="btn alt" data-action="idleStart" data-id="${esc(a.id)}" ${(b.idleStart || b.idleStop || !a.token) ? 'disabled' : ''}>${b.idleStart ? '启动挂机中...' : '开始挂机'}</button>
-          <button class="btn alt" data-action="idleStop" data-id="${esc(a.id)}" ${(b.idleStop || b.idleStart || !a.token) ? 'disabled' : ''}>${b.idleStop ? '停止中...' : '停止挂机'}</button>
-          <button class="btn alt" data-action="sectExchange" data-id="${esc(a.id)}" ${(b.sectExchange || !a.token || anyBatchBusy) ? 'disabled' : ''}>${b.sectExchange ? '兑换中...' : '兑换500残页'}</button>
-          <button class="btn" data-action="dungeonStart" data-id="${esc(a.id)}" ${(b.dungeonStart || !a.token) ? 'disabled' : ''}>${b.dungeonStart ? '自动秘境中...' : '开始自动秘境'}</button>
-          <button class="btn warn" data-action="dungeonStop" data-id="${esc(a.id)}" ${!dungeonRunning ? 'disabled' : ''}>停止自动秘境</button>
+        <div class="account-status-bar">
+          ${accountStatusPill('体力', staminaText(a), 'stamina', a.id)}
+          ${accountStatusPill('签到', signInText(a))}
+          ${accountStatusPill('月卡', monthCardText(a))}
+          ${accountStatusPill('云游', wanderText(a), 'wander', a.id)}
+          ${accountStatusPill('挂机', idleText(a.idle, a.idleError), 'idle', a.id)}
+          ${accountStatusPill('秘境', dungeonShortText(a), 'dungeon', a.id)}
+          ${accountStatusPill('功法', cdText(a.technique), 'technique', a.id)}
+          ${accountStatusPill('招募', cdText(a.partner), 'partner', a.id)}
         </div>
         ${msg ? `<div class="msg ${err ? 'err' : ''}">${esc(msg)}</div>` : ''}
-        <div class="stats" style="margin-top:12px">
-          ${stat('角色', c ? `${c.title ? `${c.title} · ` : ''}${c.nickname}` : (a.hasCharacter === false ? '未创建角色' : '未读取'), esc(realm), '', a.id)}
-          ${stat('体力', staminaText(a), staminaExtra(a), 'stamina', a.id)}
-          ${stat('灵石 / 银两', currencyText(a), currencyExtra(a), '', a.id)}
-          ${stat('稀有物品', rareItemsText(a), rareItemsExtra(a), '', a.id)}
-          ${stat('功法残页', sectFragmentText(a), sectFragmentExtra(a), '', a.id)}
-          ${stat('签到', signInText(a), signInExtra(a), '', a.id)}
-          ${stat('月卡', monthCardText(a), monthCardExtra(a), '', a.id)}
-          ${stat('云游', wanderText(a), wanderExtra(a), 'wander', a.id)}
-          ${stat('挂机状态', idleText(a.idle, a.idleError), idleExtra(a.idle, a.idleError, a), 'idle', a.id)}
-          ${stat('自动秘境', dungeonText(a), dungeonExtra(a), 'dungeon', a.id)}
-          ${stat('自动秘境日志', dungeonLogText(a), dungeonLogExtra(a), '', a.id)}
-          ${stat('功法自研冷却', cdText(a.technique), `任务：${esc(job(a.technique?.currentJobStatus))}<br>结果：${esc(job(a.technique?.resultStatus))}<br>到期：${esc(fmtTime(a.technique?.cooldownUntil))}`, 'technique', a.id)}
-          ${stat('伙伴招募冷却', cdText(a.partner), `任务：${esc(job(a.partner?.currentJobStatus))}<br>结果：${esc(job(a.partner?.resultStatus))}<br>到期：${esc(fmtTime(a.partner?.cooldownUntil))}`, 'partner', a.id)}
+        <div class="compact-stats-grid">
+          ${compactAccountStat('角色', c ? `${c.title ? `${c.title} · ` : ''}${c.nickname}` : (a.hasCharacter === false ? '未创建角色' : '未读取'), esc(realm))}
+          ${compactAccountStat('灵石 / 银两', currencyText(a), currencyExtra(a))}
+          ${compactAccountStat('稀有物品', rareItemsText(a), rareItemsExtra(a))}
+          ${compactAccountStat('功法残页', sectFragmentText(a), sectFragmentExtra(a))}
+        </div>
+        <div class="account-settings-box">
+          <button type="button" class="account-settings-toggle" data-toggle-account-settings="${esc(a.id)}" aria-expanded="${settingsOpen ? 'true' : 'false'}">
+            <div class="account-settings-toggle-main">
+              <div class="account-settings-toggle-title">账号设置 / 登录 / 秘境配置</div>
+              <div class="account-settings-toggle-sub">备注、账号密码、验证码和秘境配置都收进这里</div>
+            </div>
+            <div class="account-settings-toggle-side">${settingsOpen ? '收起' : '展开'}</div>
+          </button>
+          <div class="account-settings-body ${settingsOpen ? 'show' : ''}">
+            <div class="grid">
+              <label>备注<input data-field="alias" data-id="${esc(a.id)}" value="${esc(a.alias)}" placeholder="例如：大号 / 小号"></label>
+              <label>用户名<input data-field="username" data-id="${esc(a.id)}" value="${esc(a.username)}" placeholder="登录用户名"></label>
+              <label>密码（仅当前页面内存）<input type="password" data-field="password" data-id="${esc(a.id)}" value="${esc(t.password)}" placeholder="登录密码"></label>
+              ${captchaFieldHtml(a, t)}
+            </div>
+            <div class="cap">
+              ${captchaVisualHtml(a, t)}
+              <div class="acts">
+                <button class="btn alt" data-action="captcha" data-id="${esc(a.id)}" ${C.provider === 'local' && b.captcha ? 'disabled' : ''}>${esc(captchaButtonText(b))}</button>
+                <button class="btn" data-action="login" data-id="${esc(a.id)}" ${(b.login || C.sdkLoading) ? 'disabled' : ''}>${b.login ? '登录中...' : '登录'}</button>
+                <button class="btn alt" data-action="refresh" data-id="${esc(a.id)}" ${b.refresh || !a.token ? 'disabled' : ''}>${b.refresh ? '刷新中...' : '刷新状态'}</button>
+                <button class="btn alt" data-action="logout" data-id="${esc(a.id)}" ${!a.token ? 'disabled' : ''}>清空 Token</button>
+                <button class="btn" data-action="dungeonStart" data-id="${esc(a.id)}" ${(b.dungeonStart || !a.token) ? 'disabled' : ''}>${b.dungeonStart ? '自动秘境中...' : '开始自动秘境'}</button>
+                <button class="btn warn" data-action="dungeonStop" data-id="${esc(a.id)}" ${!dungeonRunning ? 'disabled' : ''}>停止自动秘境</button>
+                <button class="btn warn" data-action="remove" data-id="${esc(a.id)}">删除</button>
+              </div>
+            </div>
+            <div class="feature-grid">
+              <label>自动秘境（ID）<input data-field="dungeonId" data-id="${esc(a.id)}" value="${esc(a.dungeonId)}" list="dungeonCatalog" placeholder="${esc(dungeonInputPlaceholder())}"></label>
+              <label>自动秘境难度<input data-field="dungeonRank" data-id="${esc(a.id)}" type="number" min="1" step="1" value="${esc(Math.max(1, Math.floor(Number(a.dungeonRank) || 1)))}"></label>
+            </div>
+          </div>
         </div>
         ${wanderPanelHtml(a)}
       </div>`;
@@ -3596,7 +4367,9 @@
     const topErrors = [C.error, D.error, UI.noticeError].filter(Boolean).map((msg) => `<div class="msg err" style="margin-top:12px;">${esc(msg)}</div>`).join('');
     const topNotice = UI.noticeMessage ? `<div class="msg" style="margin-top:12px;">${esc(UI.noticeMessage)}</div>` : '';
     const settingsSummary = settingsSummaryText();
-    const anyGlobalBatchBusy = UI.signInAllBusy || UI.monthCardClaimAllBusy || UI.sectExchangeAllBusy;
+    const anyGlobalBatchBusy = UI.signInAllBusy || UI.monthCardClaimAllBusy || UI.sectExchangeAllBusy || UI.wanderAllBusy || UI.wanderAutoAllBusy || UI.idleAllBusy;
+    const globalToolbar = globalToolbarHtml(anyGlobalBatchBusy);
+    const globalSummary = globalSummaryCards();
     UI.shadow.innerHTML = `
       <style>${styles()}</style>
       <div class="wrap">
@@ -3614,8 +4387,10 @@
               </div>
             </div>
             ${UI.settingsOpen ? '' : `<div class="settings-summary">${esc(settingsSummary)}</div>`}
+            ${globalToolbar}
+            <div class="summary-strip">${globalSummary}</div>
             <div class="settings-box ${UI.settingsOpen ? 'show' : ''}">
-              <p class="sub">接口基于 /captcha/config、/auth/login、/character/check、/signin/overview、/signin/do、/monthcard/status、/monthcard/claim、/wander/overview、/wander/generate、/wander/choose、/idle/status、/idle/config、/dungeon/list、/dungeon/instance/create、/battle-session/start、/battle-session/current、/battle-session/:id/advance、/battle/action、/inventory/items、/character/:id/technique/status、/character/:id/technique/research/status、/partner/recruit/status、/sect/me、/sect/shop、/sect/shop/buy、/sect/donate。已兼容本地图片验证码与腾讯点击验证码；密码只保存在当前页面内存内，不写入 localStorage。</p>
+              <p class="sub">接口基于 /captcha/config、/auth/login、/character/check、/signin/overview、/signin/do、/monthcard/status、/monthcard/claim、/wander/overview、/wander/generate、/wander/choose、/idle/status、/idle/config、/dungeon/list、/dungeon/instance/create、/battle-session/start、/battle-session/current、/battle-session/:id/advance、/battle/action、/inventory/items、/character/:id/technique/status、/character/:id/technique/research/status、/partner/recruit/status、/sect/me、/sect/shop、/sect/shop/buy、/sect/donate。已兼容本地图片验证码与腾讯点击验证码；密码只保存在当前页面内存内，不写入 localStorage；自动云游 AI 改为页面填写并保存到浏览器本地，不再读取同目录 aikey.txt。</p>
               <div class="cfg">
                 <label class="wide">API Base<input id="apiBase" value="${esc(S.apiBase)}" placeholder="https://jz.faith.wang/api"></label>
                 <label>自动刷新（分钟，0 关闭）<input id="autoRefresh" type="number" min="0" step="1" value="${esc(S.autoRefreshMinutes)}"></label>
@@ -3623,17 +4398,12 @@
                 <label>冷却完成提醒<span class="inline"><input id="notifyEnabled" type="checkbox" ${S.notifyEnabled ? 'checked' : ''}> 启用浏览器提醒</span></label>
                 <label>通知权限<div class="inline" style="justify-content:space-between;"><span class="perm">${esc(notifyText())}</span><button class="btn alt" id="notifyBtn" type="button">请求授权</button></div></label>
                 <label class="wide">验证码模式<div class="inline" style="justify-content:space-between;"><span class="perm">${esc(providerName())}：${esc(providerHint())}</span><button class="btn alt" id="reloadCaptchaConfig" type="button" ${C.loading ? 'disabled' : ''}>${C.loading ? '读取中...' : '刷新模式'}</button></div></label>
+                <label class="wide">自动云游 AI<div class="inline" style="justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap;"><span class="perm">${esc(aiStatusText())}</span><div style="display:flex;gap:8px;flex-wrap:wrap;"><button class="btn alt" id="applyAiConfig" type="button" ${AI.loading ? 'disabled' : ''}>${AI.loading ? '校验中...' : '应用配置'}</button><button class="btn alt" id="clearAiConfig" type="button">清空</button></div></div><div class="settings-summary" style="margin-top:6px;">${aiStatusExtra()}</div></label>
+                <label>AI Key<input id="aiApiKey" type="password" value="${esc(aiDraftValue('apiKey'))}" placeholder="在页面输入 AI Key"></label>
+                <label>Model<input id="aiModel" value="${esc(aiDraftValue('model'))}" placeholder="例如 astron-code-latest"></label>
+                <label class="wide">OpenAI URL<input id="aiOpenaiUrl" value="${esc(aiDraftValue('openaiUrl'))}" placeholder="例如 https://example.com/v2"></label>
+                <label class="wide">Anthropic URL（可选）<input id="aiAnthropicUrl" value="${esc(aiDraftValue('anthropicUrl'))}" placeholder="可留空"></label>
               </div>
-            </div>
-            ${topErrors}
-            ${topNotice}
-            <div class="toolbar">
-              <button class="btn" id="add">新增账号</button>
-              <button class="btn alt" id="all">刷新全部状态</button>
-              <button class="btn alt" id="signInAll" ${(anyGlobalBatchBusy || !S.accounts.some((a) => a.token)) ? 'disabled' : ''}>${UI.signInAllBusy ? '全局签到中...' : '全局一键签到'}</button>
-              <button class="btn alt" id="monthCardClaimAll" ${(anyGlobalBatchBusy || !S.accounts.some((a) => a.token)) ? 'disabled' : ''}>${UI.monthCardClaimAllBusy ? '全局领取中...' : '全局领取月卡'}</button>
-              <button class="btn alt" id="sectExchangeAll" ${(anyGlobalBatchBusy || !S.accounts.some((a) => a.token)) ? 'disabled' : ''}>${UI.sectExchangeAllBusy ? '全局兑换中...' : '全局兑换500残页'}</button>
-              <button class="btn alt" id="toggleImport">${UI.importOpen ? '收起批量导入' : '批量导入'}</button>
             </div>
             <div class="import-box ${UI.importOpen ? 'show' : ''}">
               <div class="import-note">格式支持：备注,用户名,密码 或 用户名,密码；也支持制表符或竖线分隔，一行一个账号。密码只导入当前页面内存。</div>
@@ -3643,13 +4413,11 @@
                 <button class="btn alt" id="clearImport">清空文本</button>
               </div>
             </div>
+            ${topErrors}
+            ${topNotice}
           </div>
           <div class="body" data-scroll-key="main-body">
-            ${globalSummaryCards()}
-            ${xs.length ? (IS_PAGE
-              ? `<div class="page-layout"><aside class="side"><div class="side-title"><span>账号列表</span><span class="side-count">${xs.length} 个账号</span></div><div class="side-list">${xs.map(sideItem).join('')}</div></aside><section class="detail">${current ? card(current, currentIndex) : '<div class="empty">请选择账号</div>'}</section></div>`
-              : `<div class="list">${xs.map(card).join('')}</div>`)
-              : '<div class="empty">还没有账号，点上方“新增账号”。</div>'}
+            ${workspaceHtml(xs, current, currentIndex)}
             <datalist id="dungeonCatalog">${dungeonDatalistHtml()}</datalist>
             <div class="foot">仓库字段参考：E:/git/jiuzhou_src/client/src/pages/Game/modules/IdleBattle/api/idleBattleApi.ts、E:/git/jiuzhou_src/client/src/services/api/inventory.ts、E:/git/jiuzhou_src/client/src/services/api/world.ts、E:/git/jiuzhou_src/client/src/services/api/battleSession.ts</div>
           </div>
@@ -3670,12 +4438,17 @@
     s.getElementById('all')?.addEventListener('click', () => { void refreshAll(); });
     s.getElementById('signInAll')?.addEventListener('click', () => { void signInAll(); });
     s.getElementById('monthCardClaimAll')?.addEventListener('click', () => { void claimMonthCardRewardAll(); });
+    s.getElementById('wanderAll')?.addEventListener('click', () => { void executeWanderAll(); });
+    s.getElementById('wanderAutoAll')?.addEventListener('click', () => { void autoWanderAll(); });
+    s.getElementById('idleAll')?.addEventListener('click', () => { void startIdleAll(); });
     s.getElementById('sectExchangeAll')?.addEventListener('click', () => { void exchangeSectTechniqueFragmentsAll(); });
     s.getElementById('toggleImport')?.addEventListener('click', () => { UI.importOpen = !UI.importOpen; render(); });
     s.getElementById('doImport')?.addEventListener('click', () => { void importAccounts(); });
     s.getElementById('clearImport')?.addEventListener('click', () => { UI.importText = ''; render(); });
     s.getElementById('notifyBtn')?.addEventListener('click', () => { void askNotify(); });
     s.getElementById('reloadCaptchaConfig')?.addEventListener('click', () => { void refreshCaptchaConfig(); });
+    s.getElementById('applyAiConfig')?.addEventListener('click', () => { void applyAiDraftConfig(); });
+    s.getElementById('clearAiConfig')?.addEventListener('click', () => { clearAiDraftConfig(); });
     s.getElementById('apiBase')?.addEventListener('change', async (e) => {
       setField('', 'apiBase', e.target.value);
       await Promise.all([refreshCaptchaConfig(true), loadDungeonCatalog(true)]);
@@ -3685,6 +4458,12 @@
     s.getElementById('sortBy')?.addEventListener('change', (e) => setField('', 'sortBy', e.target.value));
     s.getElementById('notifyEnabled')?.addEventListener('change', (e) => setField('', 'notifyEnabled', '', e.target.checked));
     s.getElementById('importText')?.addEventListener('input', (e) => { UI.importText = e.target.value; });
+    [['aiApiKey', 'apiKey'], ['aiModel', 'model'], ['aiOpenaiUrl', 'openaiUrl'], ['aiAnthropicUrl', 'anthropicUrl']].forEach(([elementId, field]) => {
+      const el = s.getElementById(elementId);
+      if (!el) return;
+      el.addEventListener('input', (e) => { updateAiDraftField(field, e.target.value); });
+      el.addEventListener('change', () => { void applyAiDraftConfig(); });
+    });
     s.querySelectorAll('[data-select]').forEach((el) => el.addEventListener('click', (e) => {
       const id = e.currentTarget.getAttribute('data-select');
       if (id && id !== UI.selectedId) {
@@ -3698,6 +4477,12 @@
       UI.wanderOpenById[id] = UI.wanderOpenById[id] !== true;
       render();
     }));
+    s.querySelectorAll('[data-toggle-account-settings]').forEach((el) => el.addEventListener('click', (e) => {
+      const id = e.currentTarget.getAttribute('data-toggle-account-settings');
+      if (!id) return;
+      UI.accountSettingsOpenById[id] = UI.accountSettingsOpenById[id] !== true;
+      render();
+    }));
     s.querySelectorAll('[data-scroll-key]').forEach((el) => el.addEventListener('scroll', (e) => {
       const key = str(e.currentTarget.getAttribute('data-scroll-key'));
       if (!key) return;
@@ -3706,7 +4491,11 @@
     }, { passive: true }));
     s.querySelectorAll('[data-field]').forEach((el) => {
       if (el.getAttribute('data-field') === 'wanderChoiceDraft') return;
-      const handler = (e) => setField(e.target.getAttribute('data-id'), e.target.getAttribute('data-field'), e.target.value);
+      const handler = (e) => {
+        const field = e.target.getAttribute('data-field');
+        if (e.target.type === 'checkbox') setField(e.target.getAttribute('data-id'), field, e.target.value, e.target.checked);
+        else setField(e.target.getAttribute('data-id'), field, e.target.value);
+      };
       el.addEventListener('input', handler);
       el.addEventListener('change', handler);
     });
@@ -3768,6 +4557,10 @@
       const type = el.getAttribute('data-side-type');
       el.textContent = type === 'stamina'
         ? staminaText(a)
+        : type === 'technique'
+          ? cdText(a.technique)
+          : type === 'partner'
+            ? cdText(a.partner)
         : type === 'idle'
           ? idleText(a.idle, a.idleError)
           : type === 'wander'
@@ -3817,6 +4610,11 @@
       a.wanderOverview = normalizeWanderOverview(a.wanderOverview);
       if (typeof a.wanderError !== 'string') a.wanderError = '';
       a.wanderOptionIndex = normalizeWanderOptionIndex(a.wanderOptionIndex);
+      a.wanderAutoEnabled = a.wanderAutoEnabled === true;
+      if (typeof a.wanderAutoLastAt !== 'string') a.wanderAutoLastAt = '';
+      if (typeof a.wanderAutoError !== 'string') a.wanderAutoError = '';
+      if (typeof a.wanderAutoPendingEpisodeId !== 'string') a.wanderAutoPendingEpisodeId = '';
+      if (typeof a.wanderAutoLastChoice !== 'string') a.wanderAutoLastChoice = '';
       if (typeof a.techniqueNoticeKey !== 'string') a.techniqueNoticeKey = '';
       if (typeof a.partnerNoticeKey !== 'string') a.partnerNoticeKey = '';
     });
@@ -3837,8 +4635,10 @@
     sched();
     UI.tick = setInterval(updateCountdowns, 1000);
     void initCaptchaMode();
+    void ensureAiConfig();
     if (S.accounts.some((a) => a.token)) void refreshAll();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount, { once: true });
   else mount();
 })();
+

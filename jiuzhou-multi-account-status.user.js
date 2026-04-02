@@ -3069,7 +3069,7 @@
       a.wanderAutoError = '';
       a.wanderAutoLastChoice = `抉择 ${normalizedOptionIndex + 1}${reason ? ` · ${reason}` : ''}`;
     } else {
-      setMsg(a, `纭浜戞父鎶夋嫨 ${normalizedOptionIndex + 1} 涓?..`, '');
+      setMsg(a, `确认云游抉择 ${normalizedOptionIndex + 1} 中...`, '');
     }
     render();
     try {
@@ -3077,7 +3077,7 @@
       const latest = await refreshWanderState(id, { silent: true });
       clearWanderDraft(id, episodeId);
       const awardedTitle = chooseResult?.awardedTitle?.name || latest?.currentEpisode?.rewardTitleName || '';
-      const baseMessage = source === 'ai' ? `AI 自动确认抉择 ${normalizedOptionIndex + 1}` : `浜戞父宸茬‘璁ゆ妷鎷?${normalizedOptionIndex + 1}`;
+      const baseMessage = source === 'ai' ? `AI 自动确认抉择 ${normalizedOptionIndex + 1}` : `云游已确认抉择 ${normalizedOptionIndex + 1}`;
       setMsg(a, awardedTitle ? `${baseMessage}，获得称号《${awardedTitle}》` : baseMessage, '');
       if (source === 'ai') a.wanderAutoError = '';
       save();
@@ -3150,6 +3150,35 @@
       save();
       renderWhenSafe();
     }
+  }
+  async function maybeAutoProcessWander(id, overview = null, { source = '' } = {}) {
+    const a = acct(id);
+    if (!a?.token || !a?.wanderAutoEnabled) return { success: false, skipped: true, message: '自动云游未开启' };
+    const currentOverview = normalizeWanderOverview(overview || a.wanderOverview);
+    if (!currentOverview) return { success: false, skipped: true, message: '云游状态未读取' };
+    const state = loadState(id);
+    if (UI.wanderAutoBusyById[id] || state.wanderAction || state.refresh || state.login) {
+      return { success: false, skipped: true, message: '账号正忙' };
+    }
+    const episode = wanderCurrentEpisode(currentOverview);
+    if (currentOverview.hasPendingEpisode && episode?.id) {
+      return await maybeAutoHandleWander(id, currentOverview, { source });
+    }
+    if (currentOverview.isCoolingDown) return { success: false, skipped: true, cooling: true, message: '冷却中' };
+    if (currentOverview.currentGenerationJob?.status === 'pending') {
+      return { success: false, skipped: true, pending: true, message: '生成中' };
+    }
+    if (currentOverview.currentGenerationJob?.status === 'failed' || currentOverview.canGenerate) {
+      const ai = await ensureAiConfig();
+      if (!ai.ready) {
+        a.wanderAutoError = ai.error || 'AI 配置未就绪';
+        save();
+        renderWhenSafe();
+        return { success: false, skipped: true, unavailable: true, message: a.wanderAutoError };
+      }
+      return await executeWander(id, { fromGlobal: true });
+    }
+    return { success: false, skipped: true, message: '当前无需自动云游' };
   }
   async function confirmWanderChoice(id, episodeId) {
     const a = acct(id);
@@ -3892,8 +3921,8 @@
     if (silent) renderWhenSafe();
     else render();
     const latestOverview = normalizeWanderOverview(a?.wanderOverview);
-    if (a?.wanderAutoEnabled && latestOverview?.hasPendingEpisode && wanderCurrentEpisode(latestOverview)) {
-      setTimeout(() => { void maybeAutoHandleWander(id, latestOverview, { source: silent ? '自动刷新' : '刷新状态' }); }, 0);
+    if (a?.wanderAutoEnabled && latestOverview) {
+      setTimeout(() => { void maybeAutoProcessWander(id, latestOverview, { source: silent ? '自动刷新' : '刷新状态' }); }, 0);
     }
   }
   async function refreshAll(isAutomatic = false) {
@@ -4007,8 +4036,8 @@
       save();
       render();
       const overview = normalizeWanderOverview(a.wanderOverview);
-      if (a.wanderAutoEnabled && overview?.hasPendingEpisode && wanderCurrentEpisode(overview)) {
-        setTimeout(() => { void maybeAutoHandleWander(id, overview, { source: '开启自动云游' }); }, 0);
+      if (a.wanderAutoEnabled && overview) {
+        setTimeout(() => { void maybeAutoProcessWander(id, overview, { source: '开启自动云游' }); }, 0);
       }
     }
   }
